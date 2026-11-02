@@ -1,4 +1,5 @@
-from datetime import date, datetime
+from copy import copy
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
@@ -20,6 +21,205 @@ THOUSAND = Decimal(1_000)
 
 def mtok(rate: str, tokens: int) -> Decimal:
     return Decimal(rate) * tokens / MILLION
+
+
+@pytest.mark.parametrize('model_ref', ['command-a', 'command-a-03-2025'])
+def test_cohere_command_a_known_ids(model_ref: str) -> None:
+    price = calc_price(Usage(input_tokens=1), model_ref=model_ref, provider_id='cohere')
+
+    assert price.model.id == 'command-a'
+
+
+def test_cohere_command_a_variants_do_not_use_command_a_prices() -> None:
+    with pytest.raises(LookupError, match="Unable to find model with model_ref='command-a-plus-05-2026' in cohere"):
+        calc_price(Usage(input_tokens=1), model_ref='command-a-plus-05-2026', provider_id='cohere')
+
+
+def test_gemini_25_flash_context_window() -> None:
+    price = calc_price(Usage(), model_ref='gemini-2.5-flash', provider_id='google')
+
+    assert price.model.context_window == 1_048_576
+
+
+def test_google_claude_opus_45_global_prices() -> None:
+    price = calc_price(
+        Usage(
+            input_tokens=100_000,
+            cache_read_tokens=20_000,
+            cache_write_tokens=20_000,
+            cache_write_1h_tokens=10_000,
+            output_tokens=10_000,
+        ),
+        model_ref='claude-opus-4-5@20251101',
+        provider_id='google',
+    )
+
+    assert price.model.id == 'claude-opus-4-5'
+    assert price.model.context_window == 200_000
+    assert price.input_price == mtok('5', 60_000) + mtok('0.5', 20_000) + mtok('6.25', 10_000) + mtok('10', 10_000)
+    assert price.output_price == mtok('25', 10_000)
+
+
+@pytest.mark.parametrize(
+    ('input_tokens', 'rate'),
+    [(200_000, '3'), (200_001, '6')],
+)
+def test_google_claude_sonnet_45_long_context_price_boundary(input_tokens: int, rate: str) -> None:
+    price = calc_price(Usage(input_tokens=input_tokens), model_ref='claude-sonnet-4-5@20250929', provider_id='google')
+
+    assert price.model.id == 'claude-sonnet-4-5'
+    assert price.input_price == mtok(rate, input_tokens)
+
+
+def test_google_claude_sonnet_45_long_context_cache_prices() -> None:
+    usage = Usage(input_tokens=300_001, cache_read_tokens=100_000, cache_write_tokens=50_000)
+
+    price = calc_price(usage, model_ref='claude-sonnet-4-5@20250929', provider_id='google')
+
+    expected_input = mtok('6', 150_001) + mtok('0.6', 100_000) + mtok('7.5', 50_000)
+    assert price.input_price == expected_input
+
+
+@pytest.mark.parametrize(
+    'model_ref',
+    ['claude-sonnet-4', 'claude-sonnet-4-0', 'claude-sonnet-4-20250514', 'anthropic/claude-sonnet-4'],
+)
+def test_google_claude_sonnet_4_aliases_do_not_fall_back_to_anthropic(model_ref: str) -> None:
+    price = calc_price(Usage(web_searches=1), model_ref=model_ref, provider_id='google')
+
+    assert price.model.id == 'claude-4-sonnet'
+    assert price.total_price == 0
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'rate'),
+    [
+        # Gemini 3.x bills per search query, Gemini 2.5 per grounded prompt; callers report the billed count.
+        ('gemini-3-flash-preview', '14'),
+        ('gemini-3.8-flash', '14'),
+        ('gemini-nano-banana-2.1', '14'),
+        ('gemini-4-argon', '14'),
+        ('gemini-2.5-flash', '35'),
+        ('gemini-2.5-pro', '35'),
+        ('gemini-2.0-flash', '35'),
+        # Grounding is unavailable on Gemini 2.5 Flash Image, so a reported search stays free.
+        ('gemini-2.5-flash-image', '0'),
+    ],
+)
+def test_google_gemini_grounding_web_search_price(model_ref: str, rate: str) -> None:
+    price = calc_price(Usage(web_searches=2), model_ref=model_ref, provider_id='google')
+
+    assert price.total_price == Decimal(rate) * 2 / THOUSAND
+
+
+@pytest.mark.parametrize('model_ref', ['gemini-3-pro-preview', 'gemini-3-flash-preview', 'gemini-3-pro-image-preview'])
+@pytest.mark.parametrize(
+    ('timestamp', 'rate'),
+    [(datetime(2026, 1, 4, 23, 59), '0'), (datetime(2026, 1, 5), '14')],
+)
+def test_google_gemini_3_grounding_billed_from_2026_01_05(model_ref: str, timestamp: datetime, rate: str) -> None:
+    """Gemini 3 grounding billing started 2026-01-05; earlier searches on the first previews stay free."""
+    price = calc_price(
+        Usage(web_searches=2), model_ref=model_ref, provider_id='google', genai_request_timestamp=timestamp
+    )
+
+    assert price.total_price == Decimal(rate) * 2 / THOUSAND
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'hourly_rate', 'usage', 'billed_seconds'),
+    [
+        ('whisper-large-v3', Decimal('0.111'), Usage(), Decimal(0)),
+        ('whisper-large-v3', Decimal('0.111'), Usage(audio_seconds=Decimal(1)), Decimal(10)),
+        (
+            'whisper-large-v3',
+            Decimal('0.111'),
+            Usage(audio_seconds=Decimal(0), input_audio_seconds=Decimal(5)),
+            Decimal(10),
+        ),
+        ('whisper-large-v3-turbo', Decimal('0.04'), Usage(input_audio_seconds=Decimal(1)), Decimal(10)),
+        (
+            'whisper-large-v3',
+            Decimal('0.111'),
+            Usage(audio_seconds=Decimal(10), input_audio_seconds=Decimal(10)),
+            Decimal(10),
+        ),
+        (
+            'whisper-large-v3-turbo',
+            Decimal('0.04'),
+            Usage(audio_seconds=Decimal(11), input_audio_seconds=Decimal(11)),
+            Decimal(11),
+        ),
+    ],
+)
+def test_groq_transcription_duration_prices(
+    model_ref: str,
+    hourly_rate: Decimal,
+    usage: Usage,
+    billed_seconds: Decimal,
+) -> None:
+    original_usage = copy(usage)
+    price = calc_price(usage, model_ref=model_ref, provider_id='groq', genai_request_timestamp=datetime(2026, 10, 17))
+    expected_price = hourly_rate * billed_seconds / Decimal(3_600)
+
+    assert price.input_price == expected_price
+    assert price.output_price == 0
+    assert price.total_price == expected_price
+    assert usage == original_usage
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'expected_price'),
+    [('openai/gpt-oss-safeguard-20b', '0.375'), ('openai/gpt-oss-120b', '0.75')],
+)
+def test_groq_gpt_oss_safeguard_20b_has_its_own_price(model_ref: str, expected_price: str) -> None:
+    """Safeguard 20B was matched by the 120B record and billed at double its price."""
+    price = calc_price(
+        Usage(input_tokens=1_000_000, output_tokens=1_000_000),
+        model_ref,
+        provider_id='groq',
+        genai_request_timestamp=datetime(2026, 10, 17),
+    )
+
+    assert price.model.id == model_ref
+    assert price.total_price == Decimal(expected_price)
+
+
+@pytest.mark.parametrize(
+    ('provider_id', 'model_ref', 'seconds', 'expected_price'),
+    [
+        ('openai', 'gpt-transcribe', Decimal('0.5'), Decimal('0.0000375')),
+        ('openai', 'whisper-1', Decimal(30), Decimal('0.003')),
+        ('mistral', 'voxtral-mini-2602', Decimal(60), Decimal('0.003')),
+    ],
+)
+def test_transcription_duration_prices(
+    provider_id: str,
+    model_ref: str,
+    seconds: Decimal,
+    expected_price: Decimal,
+) -> None:
+    price = calc_price(
+        Usage(audio_seconds=seconds, input_audio_seconds=seconds),
+        model_ref=model_ref,
+        provider_id=provider_id,
+    )
+
+    assert price.input_price == expected_price
+    assert price.output_price == 0
+    assert price.total_price == expected_price
+
+
+def test_openai_transcription_model_ids_fail_closed() -> None:
+    price = calc_price(
+        Usage(input_tokens=1, input_audio_tokens=1),
+        model_ref='gpt-4o-transcribe-diarize',
+        provider_id='openai',
+    )
+
+    assert price.model.id == 'gpt-4o-transcribe'
+    with pytest.raises(LookupError, match="model_ref='gpt-transcribe-diarize'"):
+        calc_price(Usage(), model_ref='gpt-transcribe-diarize', provider_id='openai')
 
 
 @pytest.mark.parametrize(
@@ -103,6 +303,32 @@ def test_openai_realtime_prices_image_and_cached_image_input() -> None:
         ),
         (
             'gemini-3.1-flash-live-preview',
+            Usage(
+                input_tokens=1_000,
+                output_tokens=500,
+                input_audio_tokens=200,
+                output_audio_tokens=300,
+                input_image_tokens=100,
+                input_video_tokens=100,
+            ),
+            mtok('0.75', 600) + mtok('3', 200) + mtok('1', 100) + mtok('1', 100),
+            mtok('4.5', 200) + mtok('12', 300),
+        ),
+        (
+            'gemini-3.8-live',
+            Usage(
+                input_tokens=1_000,
+                output_tokens=500,
+                input_audio_tokens=200,
+                output_audio_tokens=300,
+                input_image_tokens=100,
+                input_video_tokens=100,
+            ),
+            mtok('0.75', 600) + mtok('3', 200) + mtok('1', 100) + mtok('1', 100),
+            mtok('4.5', 200) + mtok('12', 300),
+        ),
+        (
+            'gemini-3.8-live-extended-thinking',
             Usage(
                 input_tokens=1_000,
                 output_tokens=500,
@@ -295,6 +521,18 @@ def test_model_price_decomposition_handles_audio_cache_overlap() -> None:
     }
 
 
+def test_model_price_decomposition_handles_fractional_usage() -> None:
+    price = ModelPrice(input_mtok=Decimal('1'), cache_read_mtok=Decimal('2')).calc_price(
+        Usage(input_tokens=0.3, cache_read_tokens=0.1)
+    )
+
+    assert price == {
+        'input_price': Decimal('0.0000004'),
+        'output_price': Decimal('0'),
+        'total_price': Decimal('0.0000004'),
+    }
+
+
 def test_overlap_price_parity_handles_cached_audio_overlap() -> None:
     price = ModelPrice(
         input_mtok=Decimal('1'),
@@ -444,3 +682,432 @@ def test_tiered_price_regression_uses_provided_input_token_threshold() -> None:
         'output_price': expected_output,
         'total_price': expected_output,
     }
+
+
+@pytest.mark.parametrize(
+    ('provider_id', 'fable_5_ref', 'fable_5_1_ref'),
+    [
+        ('anthropic', 'claude-fable-5', 'claude-fable-5-1'),
+        ('anthropic', 'claude-fable-5-20260901', 'claude-fable-5-1-20260901'),
+        ('google', 'claude-fable-5', 'claude-fable-5-1'),
+        ('google', 'claude-fable-5@20260901', 'claude-fable-5-1@20260901'),
+        ('aws', 'global.anthropic.claude-fable-5-v1:0', 'global.anthropic.claude-fable-5-1-v1:0'),
+        ('aws', 'us.anthropic.claude-fable-5-v1:0', 'us.anthropic.claude-fable-5-1-v1:0'),
+        ('openrouter', 'anthropic/claude-fable-5', 'anthropic/claude-fable-5.1'),
+    ],
+)
+def test_claude_fable_5_1_does_not_use_fable_5_prices(provider_id: str, fable_5_ref: str, fable_5_1_ref: str) -> None:
+    """Fable 5.1 caches reads at 0.025x base input; Fable 5 at the usual 0.1x.
+
+    The Fable 5 records match by prefix, so a loose clause silently prices Fable 5.1 cache
+    reads 4x too high instead of failing.
+    """
+    usage = Usage(input_tokens=1_000_000, cache_read_tokens=1_000_000)
+
+    fable_5 = calc_price(
+        usage, model_ref=fable_5_ref, provider_id=provider_id, genai_request_timestamp=datetime(2026, 10, 17)
+    )
+    fable_5_1 = calc_price(
+        usage, model_ref=fable_5_1_ref, provider_id=provider_id, genai_request_timestamp=datetime(2026, 10, 17)
+    )
+
+    assert fable_5.model.id != fable_5_1.model.id
+    assert fable_5_1.total_price == fable_5.total_price / 4
+
+
+@pytest.mark.parametrize(
+    ('provider_id', 'model_ref', 'cache_read_mtok'),
+    [
+        ('anthropic', 'claude-fable-5-1', '0.25'),
+        ('anthropic', 'claude-fable-5-1-20260901', '0.25'),
+        ('google', 'claude-fable-5-1', '0.25'),
+        ('google', 'claude-fable-5-1@20260901', '0.25'),
+        ('aws', 'global.anthropic.claude-fable-5-1-v1:0', '0.25'),
+        ('aws', 'us.anthropic.claude-fable-5-1-v1:0', '0.275'),
+        ('openrouter', 'anthropic/claude-fable-5.1', '0.25'),
+    ],
+)
+def test_claude_fable_5_1_cache_read_rate(provider_id: str, model_ref: str, cache_read_mtok: str) -> None:
+    price = calc_price(
+        Usage(input_tokens=1_000_000, cache_read_tokens=1_000_000),
+        model_ref=model_ref,
+        provider_id=provider_id,
+        genai_request_timestamp=datetime(2026, 10, 17),
+    )
+
+    assert price.total_price == Decimal(cache_read_mtok)
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'model_id', 'expected'),
+    [
+        ('us.anthropic.claude-fable-5', 'regional.anthropic.claude-fable-5-v1:0', '80.85'),
+        ('eu.anthropic.claude-fable-5', 'regional.anthropic.claude-fable-5-v1:0', '80.85'),
+        ('au.anthropic.claude-fable-5', 'regional.anthropic.claude-fable-5-v1:0', '80.85'),
+        ('us.anthropic.claude-fable-5-v1:0', 'regional.anthropic.claude-fable-5-v1:0', '80.85'),
+        ('anthropic.claude-fable-5', 'regional.anthropic.claude-fable-5-v1:0', '80.85'),
+        ('global.anthropic.claude-fable-5', 'global.anthropic.claude-fable-5-v1:0', '73.5'),
+        ('global.anthropic.claude-fable-5-v1:0', 'global.anthropic.claude-fable-5-v1:0', '73.5'),
+        ('us.anthropic.claude-fable-5-1', 'regional.anthropic.claude-fable-5-1-v1:0', '80.025'),
+        ('us.anthropic.claude-fable-5-1-v1:0', 'regional.anthropic.claude-fable-5-1-v1:0', '80.025'),
+        ('anthropic.claude-fable-5-1', 'regional.anthropic.claude-fable-5-1-v1:0', '80.025'),
+        ('global.anthropic.claude-fable-5-1', 'global.anthropic.claude-fable-5-1-v1:0', '72.75'),
+        ('global.anthropic.claude-fable-5-1-v1:0', 'global.anthropic.claude-fable-5-1-v1:0', '72.75'),
+    ],
+)
+def test_aws_claude_fable_inference_profile_ids(model_ref: str, model_id: str, expected: str) -> None:
+    """Bedrock's Fable inference profile ids carry no `-v1:0` suffix; geographic ones take the regional rate."""
+    price = calc_price(
+        Usage(
+            input_tokens=3_000_000, cache_read_tokens=1_000_000, cache_write_tokens=1_000_000, output_tokens=1_000_000
+        ),
+        model_ref=model_ref,
+        provider_id='aws',
+        genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC),
+    )
+
+    assert price.model.id == model_id
+    assert price.total_price == Decimal(expected)
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'model_id', 'expected'),
+    [
+        ('in.anthropic.claude-haiku-4-5-20251001-v1:0', 'regional.anthropic.claude-haiku-4-5-20251001-v1:0', '6.6'),
+        ('in.anthropic.claude-opus-5', 'regional.anthropic.claude-opus-5', '33'),
+        ('in.anthropic.claude-opus-5-v1:0', 'regional.anthropic.claude-opus-5', '33'),
+        ('in.anthropic.claude-sonnet-5', 'regional.anthropic.claude-sonnet-5-v1:0', '13.2'),
+        ('in.anthropic.claude-sonnet-5-v1:0', 'regional.anthropic.claude-sonnet-5-v1:0', '13.2'),
+    ],
+)
+def test_aws_claude_india_inference_profile_ids(model_ref: str, model_id: str, expected: str) -> None:
+    """Bedrock's India (`in.`) inference profiles in ap-south-1 take the regional rate, like the other geographies."""
+    price = calc_price(
+        Usage(input_tokens=1_000_000, output_tokens=1_000_000),
+        model_ref=model_ref,
+        provider_id='aws',
+        genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC),
+    )
+
+    assert price.model.id == model_id
+    assert price.total_price == Decimal(expected)
+
+
+def test_openrouter_claude_fable_latest_still_points_at_fable_5() -> None:
+    """OpenRouter's family-level alias had not moved to 5.1 when 5.1 was added."""
+    price = calc_price(
+        Usage(input_tokens=1_000_000, cache_read_tokens=1_000_000),
+        model_ref='~anthropic/claude-fable-latest',
+        provider_id='openrouter',
+        genai_request_timestamp=datetime(2026, 10, 17),
+    )
+
+    assert price.total_price == Decimal('1')
+
+
+_OPUS_5_5_REFS = [
+    ('anthropic', 'claude-opus-5', 'claude-opus-5-5'),
+    ('anthropic', 'claude-opus-5-20260901', 'claude-opus-5-5-20260922'),
+    ('google', 'claude-opus-5', 'claude-opus-5-5'),
+    ('google', 'claude-opus-5@20260901', 'claude-opus-5-5@20260922'),
+    ('google', 'publishers/anthropic/models/claude-opus-5', 'publishers/anthropic/models/claude-opus-5-5'),
+    ('aws', 'global.anthropic.claude-opus-5', 'global.anthropic.claude-opus-5-5'),
+    ('aws', 'global.anthropic.claude-opus-5-v1:0', 'global.anthropic.claude-opus-5-5-v1:0'),
+    ('aws', 'us.anthropic.claude-opus-5', 'us.anthropic.claude-opus-5-5'),
+    ('aws', 'us.anthropic.claude-opus-5-v1:0', 'us.anthropic.claude-opus-5-5-v1:0'),
+    ('aws', 'anthropic.claude-opus-5', 'anthropic.claude-opus-5-5'),
+    ('openrouter', 'anthropic/claude-opus-5', 'anthropic/claude-opus-5.5'),
+]
+
+
+@pytest.mark.parametrize(('provider_id', 'opus_5_ref', 'opus_5_5_ref'), _OPUS_5_5_REFS)
+def test_claude_opus_5_5_does_not_use_opus_5_prices(provider_id: str, opus_5_ref: str, opus_5_5_ref: str) -> None:
+    """Opus 5.5 caches reads at 0.05x of a $4 base input; Opus 5 at 0.1x of $5.
+
+    The Opus 5 records matched by prefix, so `claude-opus-5-5` silently resolved to Opus 5 and
+    was priced 2.5x too high on cache reads (and 1.25x on everything else) instead of failing.
+    """
+    usage = Usage(input_tokens=1_000_000, cache_read_tokens=1_000_000)
+
+    opus_5 = calc_price(usage, model_ref=opus_5_ref, provider_id=provider_id)
+    opus_5_5 = calc_price(usage, model_ref=opus_5_5_ref, provider_id=provider_id)
+
+    assert opus_5.model.id != opus_5_5.model.id
+    assert opus_5_5.total_price * Decimal('2.5') == opus_5.total_price
+
+
+@pytest.mark.parametrize(
+    ('provider_id', 'model_ref', 'expected_price'),
+    [
+        ('anthropic', 'claude-opus-5-5', '24.2'),
+        ('google', 'claude-opus-5-5', '24.2'),
+        ('aws', 'global.anthropic.claude-opus-5-5', '24.2'),
+        ('aws', 'us.anthropic.claude-opus-5-5', '26.62'),
+        ('aws', 'eu.anthropic.claude-opus-5-5', '26.62'),
+        ('aws', 'au.anthropic.claude-opus-5-5', '26.62'),
+        ('aws', 'jp.anthropic.claude-opus-5-5', '26.62'),
+        ('aws', 'anthropic.claude-opus-5-5', '26.62'),
+        ('openrouter', 'anthropic/claude-opus-5.5', '24.2'),
+    ],
+)
+def test_claude_opus_5_5_prices(provider_id: str, model_ref: str, expected_price: str) -> None:
+    """$4 input, $0.20 cache read and $20 output per MTok globally; Bedrock regional adds 10%."""
+    price = calc_price(
+        Usage(input_tokens=2_000_000, cache_read_tokens=1_000_000, output_tokens=1_000_000),
+        model_ref=model_ref,
+        provider_id=provider_id,
+        genai_request_timestamp=datetime(2026, 10, 17),
+    )
+
+    assert price.total_price == Decimal(expected_price)
+
+
+@pytest.mark.parametrize(
+    ('provider_id', 'model_ref', 'model_id'),
+    [
+        ('anthropic', 'claude-opus-5-20260901', 'claude-opus-5'),
+        ('anthropic', 'claude-opus-5@20260901', 'claude-opus-5'),
+        ('anthropic', 'claude-opus-5-2026-09-01', 'claude-opus-5'),
+        ('anthropic', 'claude-opus-5-latest', 'claude-opus-5'),
+        ('google', 'claude-opus-5@20260901', 'claude-opus-5'),
+        ('aws', 'global.anthropic.claude-opus-5-v1:0', 'global.anthropic.claude-opus-5'),
+        ('aws', 'us.anthropic.claude-opus-5-v1:0', 'regional.anthropic.claude-opus-5'),
+    ],
+)
+def test_tightened_claude_opus_5_matchers_keep_existing_forms(provider_id: str, model_ref: str, model_id: str) -> None:
+    """The Opus 5 clauses were tightened to stop at Opus 5; its dated and `-v1:0` forms must still resolve."""
+    price = calc_price(Usage(input_tokens=1_000_000), model_ref=model_ref, provider_id=provider_id)
+
+    assert price.model.id == model_id
+
+
+@pytest.mark.parametrize(
+    ('timestamp', 'expected_price'),
+    [(datetime(2026, 9, 21, 23, 59), '25.5'), (datetime(2026, 9, 22), '20.2')],
+)
+def test_openrouter_claude_opus_latest_moves_to_opus_5_5(timestamp: datetime, expected_price: str) -> None:
+    """OpenRouter's family-level alias moved to Opus 5.5 on release; earlier requests keep the Opus 5 rate."""
+    price = calc_price(
+        Usage(input_tokens=1_000_000, cache_read_tokens=1_000_000, output_tokens=1_000_000),
+        model_ref='~anthropic/claude-opus-latest',
+        provider_id='openrouter',
+        genai_request_timestamp=timestamp,
+    )
+
+    assert price.total_price == Decimal(expected_price)
+
+
+@pytest.mark.parametrize(
+    ('timestamp', 'expected_price'),
+    [(datetime(2026, 3, 12, 23, 59), '47.5'), (datetime(2026, 3, 13), '30')],
+)
+def test_vertex_claude_opus_4_6_drops_long_context_premium(timestamp: datetime, expected_price: str) -> None:
+    """Vertex AI dropped the >200K premium for Opus 4.6 on 2026-03-13, as Anthropic did."""
+    price = calc_price(
+        Usage(input_tokens=1_000_000, output_tokens=1_000_000),
+        model_ref='claude-opus-4-6',
+        provider_id='google',
+        genai_request_timestamp=timestamp,
+    )
+
+    assert price.total_price == Decimal(expected_price)
+
+
+@pytest.mark.parametrize(
+    ('provider_id', 'model_ref', 'model_id', 'expected_price'),
+    [
+        ('anthropic', 'claude-sonnet-5-5', 'claude-sonnet-5-5', '12.1'),
+        ('anthropic', 'claude-sonnet-5-5-20260928', 'claude-sonnet-5-5', '12.1'),
+        ('google', 'claude-sonnet-5-5', 'claude-sonnet-5-5', '12.1'),
+        ('google', 'claude-sonnet-5-5@20260928', 'claude-sonnet-5-5', '12.1'),
+        ('google', 'publishers/anthropic/models/claude-sonnet-5-5', 'claude-sonnet-5-5', '12.1'),
+        ('aws', 'global.anthropic.claude-sonnet-5-5', 'global.anthropic.claude-sonnet-5-5', '12.1'),
+        ('aws', 'global.anthropic.claude-sonnet-5-5-v1:0', 'global.anthropic.claude-sonnet-5-5', '12.1'),
+        ('aws', 'us.anthropic.claude-sonnet-5-5', 'regional.anthropic.claude-sonnet-5-5', '13.31'),
+        ('aws', 'us.anthropic.claude-sonnet-5-5-v1:0', 'regional.anthropic.claude-sonnet-5-5', '13.31'),
+        ('aws', 'anthropic.claude-sonnet-5-5', 'regional.anthropic.claude-sonnet-5-5', '13.31'),
+        ('openrouter', 'anthropic/claude-sonnet-5.5', 'anthropic/claude-sonnet-5.5', '12.1'),
+    ],
+)
+def test_claude_sonnet_5_5_resolves_to_its_own_model(
+    provider_id: str, model_ref: str, model_id: str, expected_price: str
+) -> None:
+    """Sonnet 5.5 resolves to its own model, and bills cache reads at half Sonnet 5's rate (0.05x input)."""
+    price = calc_price(
+        Usage(input_tokens=2_000_000, cache_read_tokens=1_000_000, output_tokens=1_000_000),
+        model_ref=model_ref,
+        provider_id=provider_id,
+        genai_request_timestamp=datetime(2026, 10, 17),
+    )
+
+    assert price.model.id == model_id
+    assert price.total_price == Decimal(expected_price)
+
+
+@pytest.mark.parametrize(
+    ('provider_id', 'model_ref', 'model_id'),
+    [
+        ('anthropic', 'claude-sonnet-5', 'claude-sonnet-5'),
+        ('anthropic', 'claude-sonnet-5-20260630', 'claude-sonnet-5'),
+        ('google', 'claude-sonnet-5@20260630', 'claude-sonnet-5'),
+        ('aws', 'global.anthropic.claude-sonnet-5', 'global.anthropic.claude-sonnet-5-v1:0'),
+        ('aws', 'global.anthropic.claude-sonnet-5-v1:0', 'global.anthropic.claude-sonnet-5-v1:0'),
+        ('aws', 'us.anthropic.claude-sonnet-5-v1:0', 'regional.anthropic.claude-sonnet-5-v1:0'),
+        ('aws', 'anthropic.claude-sonnet-5', 'regional.anthropic.claude-sonnet-5-v1:0'),
+    ],
+)
+def test_tightened_claude_sonnet_5_matchers_keep_existing_forms(
+    provider_id: str, model_ref: str, model_id: str
+) -> None:
+    """The Sonnet 5 clauses were tightened to stop at Sonnet 5; its dated and `-v1:0` forms must still resolve."""
+    price = calc_price(Usage(input_tokens=1_000_000), model_ref=model_ref, provider_id=provider_id)
+
+    assert price.model.id == model_id
+
+
+@pytest.mark.parametrize(
+    ('timestamp', 'expected_price'),
+    [(datetime(2026, 9, 27, 23, 59), '18'), (datetime(2026, 9, 28), '12')],
+)
+def test_openrouter_claude_sonnet_latest_moves_to_sonnet_5_5(timestamp: datetime, expected_price: str) -> None:
+    """OpenRouter's family-level alias resolves to $2/$10 Sonnet 5.5 from the date that was verified."""
+    price = calc_price(
+        Usage(input_tokens=1_000_000, output_tokens=1_000_000),
+        model_ref='~anthropic/claude-sonnet-latest',
+        provider_id='openrouter',
+        genai_request_timestamp=timestamp,
+    )
+
+    assert price.total_price == Decimal(expected_price)
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'model_id', 'expected_price'),
+    [
+        ('amazon.titan-embed-text-v1', 'amazon.titan-embed-text-v1', '0.1'),
+        ('amazon.titan-embed-text', 'amazon.titan-embed-text-v1', '0.1'),
+        ('us.amazon.titan-embed-text-v1', 'amazon.titan-embed-text-v1', '0.1'),
+        ('amazon.titan-embed-text-v2:0', 'amazon.titan-embed-text-v2:0', '0.02'),
+        ('amazon.titan-embed-text-v2', 'amazon.titan-embed-text-v2:0', '0.02'),
+        ('us.amazon.titan-embed-text-v2:0', 'amazon.titan-embed-text-v2:0', '0.02'),
+    ],
+)
+def test_aws_titan_embed_text_v2_does_not_use_v1_prices(model_ref: str, model_id: str, expected_price: str) -> None:
+    price = calc_price(
+        Usage(input_tokens=1_000_000),
+        model_ref=model_ref,
+        provider_id='aws',
+        genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC),
+    )
+
+    assert price.model.id == model_id
+    assert price.total_price == Decimal(expected_price)
+
+
+@pytest.mark.parametrize(
+    ('provider_id', 'model_ref', 'model_id', 'base_price', 'long_context_price'),
+    [
+        ('anthropic', 'claude-haiku-5-5', 'claude-haiku-5-5', '0.06', '0.3000005'),
+        ('anthropic', 'claude-haiku-5-5-20261007', 'claude-haiku-5-5', '0.06', '0.3000005'),
+        ('google', 'claude-haiku-5-5', 'claude-haiku-5-5', '0.06', '0.3000005'),
+        ('google', 'claude-haiku-5-5@20261007', 'claude-haiku-5-5', '0.06', '0.3000005'),
+        ('google', 'publishers/anthropic/models/claude-haiku-5-5', 'claude-haiku-5-5', '0.06', '0.3000005'),
+        ('aws', 'global.anthropic.claude-haiku-5-5', 'global.anthropic.claude-haiku-5-5', '0.06', '0.3000005'),
+        ('aws', 'global.anthropic.claude-haiku-5-5-v1:0', 'global.anthropic.claude-haiku-5-5', '0.06', '0.3000005'),
+        ('aws', 'us.anthropic.claude-haiku-5-5', 'regional.anthropic.claude-haiku-5-5', '0.066', '0.33000055'),
+        ('aws', 'eu.anthropic.claude-haiku-5-5-v1:0', 'regional.anthropic.claude-haiku-5-5', '0.066', '0.33000055'),
+        ('aws', 'anthropic.claude-haiku-5-5', 'regional.anthropic.claude-haiku-5-5', '0.066', '0.33000055'),
+        ('openrouter', 'anthropic/claude-haiku-5.5', 'anthropic/claude-haiku-5.5', '0.06', '0.3000005'),
+        ('openrouter', 'anthropic/claude-haiku-5.5-20261007', 'anthropic/claude-haiku-5.5', '0.06', '0.3000005'),
+        ('openrouter', 'anthropic/claude-haiku-5.5:batch', 'anthropic/claude-haiku-5.5:batch', '0.03', '0.15000025'),
+    ],
+)
+def test_claude_haiku_5_5_prices_by_prompt_length(
+    provider_id: str, model_ref: str, model_id: str, base_price: str, long_context_price: str
+) -> None:
+    """Haiku 5.5 bills every token at 5x once the prompt exceeds 100,000 tokens; exactly 100,000 stays on the base rate and 100,001 does not."""
+    base = calc_price(
+        Usage(input_tokens=100_000, output_tokens=100_000),
+        model_ref=model_ref,
+        provider_id=provider_id,
+        genai_request_timestamp=datetime(2026, 10, 17),
+    )
+    long_context = calc_price(
+        Usage(input_tokens=100_001, output_tokens=100_000),
+        model_ref=model_ref,
+        provider_id=provider_id,
+        genai_request_timestamp=datetime(2026, 10, 17),
+    )
+
+    assert base.model.id == model_id
+    assert base.total_price == Decimal(base_price)
+    assert long_context.total_price == Decimal(long_context_price)
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'base_price', 'long_context_price'),
+    [
+        ('anthropic/claude-haiku-5.5', '0.02', '0.100001'),
+        ('anthropic/claude-haiku-5.5-20261007', '0.02', '0.100001'),
+        ('anthropic/claude-haiku-5.5:batch', '0.01', '0.0500005'),
+        ('~anthropic/claude-haiku-latest', '0.02', '0.100001'),
+    ],
+)
+def test_openrouter_claude_haiku_5_5_one_hour_cache_writes(
+    model_ref: str, base_price: str, long_context_price: str
+) -> None:
+    for tokens, expected_price in ((100_000, base_price), (100_001, long_context_price)):
+        price = calc_price(
+            Usage(input_tokens=tokens, cache_write_tokens=tokens, cache_write_1h_tokens=tokens),
+            model_ref=model_ref,
+            provider_id='openrouter',
+            genai_request_timestamp=datetime(2026, 10, 7),
+        )
+
+        assert price.total_price == Decimal(expected_price)
+
+
+@pytest.mark.parametrize(
+    ('timestamp', 'expected_price'),
+    [(datetime(2026, 10, 6, 23, 59), '6'), (datetime(2026, 10, 7), '3')],
+)
+def test_openrouter_claude_haiku_latest_moves_to_haiku_5_5(timestamp: datetime, expected_price: str) -> None:
+    """OpenRouter's family-level Haiku alias moved from $1/$5 Haiku 4.5 to tiered Haiku 5.5 on its release."""
+    price = calc_price(
+        Usage(input_tokens=1_000_000, output_tokens=1_000_000),
+        model_ref='~anthropic/claude-haiku-latest',
+        provider_id='openrouter',
+        genai_request_timestamp=timestamp,
+    )
+
+    assert price.total_price == Decimal(expected_price)
+
+
+@pytest.mark.parametrize(
+    ('model', 'input_rate', 'output_rate', 'cache_rate'),
+    [
+        ('claude-haiku-5-5', '0.025', '0.125', '0.0025'),
+        ('gpt-6-astra', '10', '50', '1'),
+        ('gpt-6-luna', '0.1', '0.5', '0.01'),
+        ('gpt-6.1-sol', '2', '10', '0.1'),
+        ('gpt-6-sol', '2', '10', '0.2'),
+        ('grok-4.6', '2', '6', '0.5'),
+        ('grok-4.7', '2', '6', '0.5'),
+    ],
+)
+@pytest.mark.parametrize('input_tokens', [200_000, 200_001])
+def test_quicksilver_long_context_prices(
+    model: str, input_rate: str, output_rate: str, cache_rate: str, input_tokens: int
+) -> None:
+    long = input_tokens > 200_000
+    input_multiplier = 5 if model == 'claude-haiku-5-5' else 2
+    output_multiplier = 5 if model == 'claude-haiku-5-5' else 2 if model.startswith('grok') else Decimal('1.5')
+    price = calc_price(
+        Usage(input_tokens=input_tokens, cache_read_tokens=50_000, output_tokens=1_000_000),
+        model_ref=model,
+        provider_id='quicksilverpro',
+    )
+    assert price.input_price == (mtok(input_rate, input_tokens - 50_000) + mtok(cache_rate, 50_000)) * (
+        input_multiplier if long else 1
+    )
+    assert price.output_price == Decimal(output_rate) * (output_multiplier if long else 1)

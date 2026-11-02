@@ -63,12 +63,139 @@ simonw-prices-get: ## get simonw-prices
 huggingface-get: ## get huggingface prices
 	uv run -m prices get_huggingface_prices
 
+.PHONY: cerebras-get
+cerebras-get: ## get cerebras model prices
+	uv run -m prices get_cerebras_prices
+
+.PHONY: cloudflare-get
+cloudflare-get: ## get cloudflare workers ai prices
+	uv run -m prices get_cloudflare_prices
+
+.PHONY: anthropic-get
+anthropic-get: ## get anthropic model prices
+	uv run -m prices get_anthropic_prices
+
+.PHONY: arcee-get
+arcee-get: ## get arcee model prices
+	uv run -m prices get_arcee_prices
+
+.PHONY: aws-get
+aws-get: ## get aws bedrock model prices
+	uv run -m prices get_aws_prices
+
+.PHONY: avian-get
+avian-get: ## get avian model prices
+	uv run -m prices get_avian_prices
+
+.PHONY: azure-get
+azure-get: ## get microsoft azure prices from the azure retail prices api
+	uv run -m prices get_azure_prices
+
+.PHONY: baseten-get
+baseten-get: ## get baseten model prices
+	uv run -m prices get_baseten_prices
+
+.PHONY: cursor-get
+cursor-get: ## get cursor model prices
+	uv run -m prices get_cursor_prices
+
+.PHONY: doubleword-get
+doubleword-get: ## get doubleword realtime model prices
+	uv run -m prices get_doubleword_prices
+
+.PHONY: elevenlabs-get
+elevenlabs-get: ## get elevenlabs realtime model prices
+	uv run -m prices get_elevenlabs_prices
+
+.PHONY: github-copilot-get
+github-copilot-get: ## get github copilot prices
+	uv run -m prices get_github_copilot_prices
+
+.PHONY: novita-get
+novita-get: ## get novita model prices
+	uv run -m prices get_novita_prices
+
+.PHONY: meta-get
+meta-get: ## get meta model api prices
+	uv run -m prices get_meta_prices
+
+.PHONY: minimax-get
+minimax-get: ## get minimax prices
+	uv run -m prices get_minimax_prices
+
+.PHONY: moonshotai-get
+moonshotai-get: ## get moonshot ai prices
+	uv run -m prices get_moonshotai_prices
+
+.PHONY: openai-decisions-get
+openai-decisions-get: ## get openai decisions model prices
+	uv run -m prices get_openai_decisions_prices
+
 .PHONY: ovhcloud-get
 ovhcloud-get: ## get ovhcloud ai endpoints prices
 	uv run -m prices get_ovhcloud_prices
 
+.PHONY: quicksilverpro-get
+quicksilverpro-get: ## get quicksilver pro prices
+	uv run -m prices get_quicksilverpro_prices
+
+.PHONY: typesafe-get
+typesafe-get: ## get typesafe model prices
+	uv run -m prices get_typesafe_prices
+
+.PHONY: voyageai-get
+voyageai-get: ## get voyage ai model prices
+	uv run -m prices get_voyageai_prices
+
+.PHONY: zai-get
+zai-get: ## get z.ai prices
+	uv run -m prices get_zai_prices
+
+.PHONY: google-get
+google-get: ## get google gemini api prices
+	uv run -m prices get_google_prices
+
+.PHONY: groq-get
+groq-get: ## get groq model prices
+	uv run -m prices get_groq_prices
+
+.PHONY: perplexity-get
+perplexity-get: ## get perplexity decisions, embeddings and agent api prices
+	uv run -m prices get_perplexity_prices
+
+.PHONY: together-get
+together-get: ## get together ai model prices
+	uv run -m prices get_together_prices
+
+.PHONY: mistral-get
+mistral-get: ## get mistral model prices
+	uv run -m prices get_mistral_prices
+.PHONY: openai-get
+openai-get: ## get openai model prices
+	uv run -m prices get_openai_prices
+
+.PHONY: xai-get
+xai-get: ## get xai model prices
+	uv run -m prices get_xai_prices
+
+.PHONY: databricks-get
+databricks-get: ## get databricks foundation model api prices
+	uv run -m prices get_databricks_prices
+
+.PHONY: fireworks-get
+fireworks-get: ## get fireworks serverless prices
+	uv run -m prices get_fireworks_prices
+
+.PHONY: modal-get
+modal-get: ## get modal shared endpoint prices
+	uv run -m prices get_modal_prices
+
+.PHONY: openrouter-provider-get
+openrouter-provider-get: ## get openrouter provider prices
+	uv run -m prices get_openrouter_provider_prices
+
 .PHONY: get-all-prices
-get-all-prices: helicone-get openrouter-get litellm-get simonw-prices-get huggingface-get ovhcloud-get ## get all prices
+get-all-prices: helicone-get openrouter-get litellm-get simonw-prices-get huggingface-get arcee-get avian-get azure-get baseten-get cerebras-get cloudflare-get cursor-get doubleword-get elevenlabs-get github-copilot-get meta-get minimax-get moonshotai-get novita-get openai-decisions-get ovhcloud-get quicksilverpro-get typesafe-get voyageai-get zai-get groq-get perplexity-get together-get xai-get openrouter-provider-get google-get anthropic-get databricks-get fireworks-get modal-get aws-get openai-get mistral-get ## get all prices
 
 .PHONE: update-price-discrepancies
 update-price-discrepancies: ## update price discrepancies
@@ -97,25 +224,63 @@ typecheck:
 test: ## Run tests and collect coverage data
 	uv run coverage run -m pytest
 	uv run python tests/dataset/extract_usages.py
-	@uv run coverage report --fail-under=0
+	@$(MAKE) coverage-report
 
 .PHONY: testcov
 testcov: test ## Run tests and generate an HTML coverage report
 	@echo "building coverage html"
 	@uv run coverage html
 
+.PHONY: coverage-report
+coverage-report: ## Report coverage for all Python code
+	@uv run coverage report
+
 .PHONY: test-all-python
-test-all-python: ## Run tests on Python 3.10 to 3.14
-	UV_PROJECT_ENVIRONMENT=.venv310 uv run --python 3.10 --all-extras --all-packages coverage run -p -m pytest
+test-all-python: ## Run tests on Python 3.11 to 3.15
 	UV_PROJECT_ENVIRONMENT=.venv311 uv run --python 3.11 --all-extras --all-packages coverage run -p -m pytest
 	UV_PROJECT_ENVIRONMENT=.venv312 uv run --python 3.12 --all-extras --all-packages coverage run -p -m pytest
 	UV_PROJECT_ENVIRONMENT=.venv313 uv run --python 3.13 --all-extras --all-packages coverage run -p -m pytest
 	UV_PROJECT_ENVIRONMENT=.venv314 uv run --python 3.14 --all-extras --all-packages coverage run -p -m pytest
+	UV_PROJECT_ENVIRONMENT=.venv315 uv run --python 3.15 --all-extras --all-packages coverage run -p -m pytest
 	@uv run coverage combine
-	@uv run coverage report
+	@$(MAKE) coverage-report
+
+.PHONY: test-js
+test-js: ## Build, typecheck, lint and test the JS package with coverage
+	npm run ci
+
+.PHONY: format-go
+format-go: ## Format the Go package
+	cd packages/go && gofmt -w $$(find . -name '*.go' -type f)
+
+.PHONY: lint-go
+lint-go: ## Lint the Go package
+	cd packages/go && go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.10.1 run ./...
+
+.PHONY: test-go
+test-go: ## Test the Go package with the race detector and coverage
+	cd packages/go && go test -race -coverprofile=coverage.out ./...
+	cd packages/go && go tool cover -func=coverage.out
+	@cd packages/go && go tool cover -func=coverage.out | \
+		awk '/^total:/ && $$3 + 0 < 90 { print "Go coverage must be at least 90%"; exit 1 }'
+
+.PHONY: format-rust
+format-rust: ## Format the Rust crate
+	cd packages/rust && cargo fmt
+
+.PHONY: lint-rust
+lint-rust: ## Lint the Rust crate
+	cd packages/rust && cargo fmt --check
+	cd packages/rust && cargo clippy --all-targets --locked -- -D warnings
+	cd packages/rust && cargo clippy --all-targets --locked --no-default-features -- -D warnings
+
+.PHONY: test-rust
+test-rust: ## Test the Rust crate; fails below 95% line coverage
+	cd packages/rust && cargo llvm-cov --locked --fail-under-lines 95
+	cd packages/rust && cargo test --locked --no-default-features
 
 .PHONY: all
-all: build package-data format lint typecheck testcov ## Run code formatting, linting, static type checks, and tests with coverage report generation
+all: build package-data format format-go format-rust lint lint-go lint-rust typecheck testcov test-js test-go test-rust ## Run all builds, checks, and tests
 
 .PHONY: help
 help: ## Show this help (usage: make help)

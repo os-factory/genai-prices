@@ -2,7 +2,8 @@
 name: MoonshotAi
 id: moonshotai
 pricing_urls:
-  - https://platform.moonshot.ai/docs/pricing/chat#product-pricing
+  - https://platform.kimi.ai/docs/models.md
+  - https://platform.kimi.ai/docs/pricing/chat.md
 api_pattern: 'https://api\.moonshot\.'
 model_match:
   or:
@@ -19,6 +20,13 @@ extractors:
       - path: [prompt_tokens_details, cached_tokens]
         dest: cache_read_tokens
         required: false
+      # The response does not echo the requested TTL, so writes bill at the default 5-minute rate.
+      - path: [prompt_tokens_details, cache_write_tokens]
+        dest: cache_write_tokens
+        required: false
+      - path: [completion_tokens_details, reasoning_tokens]
+        dest: output_reasoning_tokens
+        required: false
       - path: completion_tokens
         dest: output_tokens
 
@@ -30,6 +38,11 @@ models:
       total parameters with 32 billion active per forward pass.
     match:
       equals: kimi-k2
+    # The kimi-k2 series was discontinued by Moonshot on 2026-05-25 (see https://platform.kimi.ai/docs/models.md);
+    # prices kept for historical usage.
+    # No context_window: the kimi-k2 family spans two windows — kimi-k2-0711-preview was 128k and
+    # kimi-k2-0905-preview 256k — so no single value is true for the bare name.
+    deprecated: true
     prices_checked: 2026-06-09
     prices:
       input_mtok: 0.57
@@ -43,6 +56,9 @@ models:
     match:
       equals: kimi-k2-0711-preview
     context_window: 131072
+    # The kimi-k2 series was discontinued by Moonshot on 2026-05-25 (see https://platform.kimi.ai/docs/models.md);
+    # prices kept for historical usage.
+    deprecated: true
     prices_checked: 2026-03-11
     prices:
       input_mtok: 0.60
@@ -58,6 +74,9 @@ models:
     match:
       equals: kimi-k2-0905-preview
     context_window: 262144
+    # The kimi-k2 series was discontinued by Moonshot on 2026-05-25 (see https://platform.kimi.ai/docs/models.md);
+    # prices kept for historical usage.
+    deprecated: true
     prices_checked: 2026-03-11
     prices:
       input_mtok: 0.60
@@ -71,6 +90,9 @@ models:
     match:
       equals: kimi-k2-thinking
     context_window: 262144
+    # The kimi-k2 series was discontinued by Moonshot on 2026-05-25 (see https://platform.kimi.ai/docs/models.md);
+    # prices kept for historical usage.
+    deprecated: true
     prices_checked: 2026-03-11
     prices:
       input_mtok: 0.60
@@ -85,6 +107,9 @@ models:
     match:
       equals: kimi-k2-thinking-turbo
     context_window: 262144
+    # The kimi-k2 series was discontinued by Moonshot on 2026-05-25 (see https://platform.kimi.ai/docs/models.md);
+    # prices kept for historical usage.
+    deprecated: true
     prices_checked: 2026-03-11
     prices:
       input_mtok: 1.15
@@ -99,6 +124,9 @@ models:
     match:
       starts_with: kimi-k2-turbo
     context_window: 262144
+    # The kimi-k2 series was discontinued by Moonshot on 2026-05-25 (see https://platform.kimi.ai/docs/models.md);
+    # prices kept for historical usage.
+    deprecated: true
     prices_checked: 2026-03-11
     prices:
       input_mtok: 1.15
@@ -114,7 +142,10 @@ models:
     match:
       starts_with: kimi-k2.5
     context_window: 262144
-    prices_checked: 2026-03-11
+    # Discontinued by Moonshot on 2026-08-31 (https://platform.kimi.ai/docs/models.md);
+    # prices kept for historical usage.
+    deprecated: true
+    prices_checked: 2026-10-09
     prices:
       input_mtok: 0.60
       cache_read_mtok: 0.10
@@ -130,7 +161,8 @@ models:
     match:
       starts_with: kimi-k2.6
     context_window: 262144
-    prices_checked: "2026-05-22"
+    prices_checked: 2026-10-27
+    price_comments: "Ref: https://platform.kimi.ai/docs/pricing/chat-k26.md"
     prices:
       input_mtok: 0.95
       cache_read_mtok: 0.16
@@ -145,12 +177,27 @@ models:
     match:
       equals: kimi-k2.7-code
     context_window: 262144
-    prices_checked: "2026-06-15"
+    prices_checked: 2026-10-27
     price_comments: "Ref: https://platform.kimi.ai/docs/pricing/chat-k27-code.md"
     prices:
       input_mtok: 0.95
       cache_read_mtok: 0.19
       output_mtok: 4.00
+
+  - id: kimi-k2.7-code-highspeed
+    name: Kimi K2.7 Code HighSpeed
+    description: >-
+      High-speed version of Kimi K2.7 Code, with output speed of approximately 180 tokens/sec and up to
+      260 tokens/sec in short context scenarios.
+    match:
+      equals: kimi-k2.7-code-highspeed
+    context_window: 262144
+    prices_checked: 2026-10-27
+    price_comments: "Ref: https://platform.kimi.ai/docs/pricing/chat-k27-code.md"
+    prices:
+      input_mtok: 1.90
+      cache_read_mtok: 0.38
+      output_mtok: 8.00
 
   - id: kimi-k3
     name: Kimi K3
@@ -160,12 +207,42 @@ models:
     match:
       equals: kimi-k3
     context_window: 1048576
-    prices_checked: "2026-07-16"
-    price_comments: "Ref: https://platform.kimi.ai/docs/pricing/chat-k3.md"
+    prices_checked: 2026-10-27
+    price_comments: >-
+      Ref: https://platform.kimi.ai/docs/pricing/chat-k3.md. Re-verified on 2026-10-15: input,
+      cached input and output rates are unchanged; the page now also publishes 5-minute cache
+      writes at $3 / 1M tokens and 1-hour cache writes at $6 / 1M tokens, both added on
+      2026-10-15.
     prices:
       input_mtok: 3.00
       cache_read_mtok: 0.30
+      cache_write_mtok: 3.00
+      cache_write_1h_mtok: 6.00
       output_mtok: 15.00
+
+  - id: kimi-k3.1-pro
+    match:
+      equals: kimi-k3.1-pro
+    context_window: 1048576
+    prices:
+      input_mtok: 2
+      cache_write_mtok: 2
+      cache_read_mtok: 0.2
+      output_mtok: 10
+      cache_write_1h_mtok: 4
+    prices_checked: 2026-10-27
+
+  - id: kimi-k3.1-pro-highspeed
+    match:
+      equals: kimi-k3.1-pro-highspeed
+    context_window: 1048576
+    prices:
+      input_mtok: 4
+      cache_write_mtok: 4
+      cache_read_mtok: 0.2
+      output_mtok: 20
+      cache_write_1h_mtok: 8
+    prices_checked: 2026-10-27
 
   - id: moonshot-v1-128k
     name: Moonshot V1 128K
@@ -174,7 +251,10 @@ models:
         - equals: moonshot-v1-128k
         - equals: moonshot-v1-128k-vision-preview
     context_window: 131072
-    prices_checked: 2026-03-11
+    # Discontinued by Moonshot on 2026-08-31 (https://platform.kimi.ai/docs/models.md);
+    # prices kept for historical usage.
+    deprecated: true
+    prices_checked: 2026-10-09
     prices:
       input_mtok: 2.00
       output_mtok: 5.00
@@ -186,7 +266,10 @@ models:
         - equals: moonshot-v1-32k
         - equals: moonshot-v1-32k-vision-preview
     context_window: 32768
-    prices_checked: 2026-03-11
+    # Discontinued by Moonshot on 2026-08-31 (https://platform.kimi.ai/docs/models.md);
+    # prices kept for historical usage.
+    deprecated: true
+    prices_checked: 2026-10-09
     prices:
       input_mtok: 1.00
       output_mtok: 3.00
@@ -198,7 +281,10 @@ models:
         - equals: moonshot-v1-8k
         - equals: moonshot-v1-8k-vision-preview
     context_window: 8192
-    prices_checked: 2026-03-11
+    # Discontinued by Moonshot on 2026-08-31 (https://platform.kimi.ai/docs/models.md);
+    # prices kept for historical usage.
+    deprecated: true
+    prices_checked: 2026-10-09
     prices:
       input_mtok: 0.20
       output_mtok: 2.00

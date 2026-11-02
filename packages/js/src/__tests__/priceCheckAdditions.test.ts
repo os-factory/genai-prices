@@ -1,0 +1,83 @@
+import { expect, it } from 'vitest'
+
+import type { PriceContext } from '../types'
+
+import { calcPrice } from '../api'
+
+const ttsCases: { context: PriceContext; model: string; totals: [number, number] }[] = [
+  { context: {}, model: 'gemini-3.8-flash-tts', totals: [9.5, 19] },
+  { context: { processing: 'batch' }, model: 'gemini-3.8-flash-tts', totals: [4.75, 9.5] },
+  { context: { service_tier: 'flex' }, model: 'gemini-3.8-flash-tts', totals: [4.75, 9.5] },
+  { context: { service_tier: 'priority' }, model: 'gemini-3.8-flash-tts', totals: [17.1, 34.2] },
+  { context: {}, model: 'gemini-3.8-flash-lite-tts', totals: [6.5, 13] },
+  { context: { processing: 'batch' }, model: 'gemini-3.8-flash-lite-tts', totals: [3.25, 6.5] },
+  { context: { service_tier: 'flex' }, model: 'gemini-3.8-flash-lite-tts', totals: [3.25, 6.5] },
+  { context: { service_tier: 'priority' }, model: 'gemini-3.8-flash-lite-tts', totals: [11.7, 23.4] },
+]
+
+it.each(ttsCases)('prices $model in $context across the January 2027 boundary', ({ context, model, totals }) => {
+  for (const { timestamp, total } of [
+    { timestamp: '2026-12-31T23:59:00Z', total: totals[0] },
+    { timestamp: '2027-01-01T00:00:00Z', total: totals[1] },
+  ]) {
+    const price = calcPrice({ input_tokens: 1_000_000, output_audio_tokens: 1_000_000, output_tokens: 1_000_000 }, model, {
+      priceContext: context,
+      providerId: 'google',
+      timestamp: new Date(timestamp),
+    })
+    expect(price?.model.id).toBe(model)
+    expect(price?.total_price).toBeCloseTo(total, 12)
+  }
+})
+
+it('prices Nano Banana search grounding', () => {
+  expect(calcPrice({ web_searches: 1_000 }, 'gemini-nano-banana-2.1', { providerId: 'google' })?.total_price).toBe(14)
+})
+
+it.each([
+  { model: 'kimi-k2.6', total: 4.7525 },
+  { model: 'kimi-k2.7-code', total: 4.76 },
+  { model: 'kimi-k2.7-code-highspeed', total: 9.52 },
+])('prices the verified Moonshot $model rates', ({ model, total }) => {
+  expect(
+    calcPrice({ cache_read_tokens: 250_000, input_tokens: 1_000_000, output_tokens: 1_000_000 }, model, {
+      providerId: 'moonshotai',
+      timestamp: new Date('2026-10-17T00:00:00Z'),
+    })?.total_price
+  ).toBeCloseTo(total, 12)
+})
+
+it.each(['jev-1.14.0', 'jev-preview'])('preserves the default context limit for %s', (model) => {
+  const price = calcPrice({ input_tokens: 1_000_000 }, model, { providerId: 'typesafe', timestamp: new Date('2026-10-18T00:00:00Z') })
+  expect(price?.model.id).toBe('jev-1.14.0')
+  expect(price?.model.context_window).toBe(32_000)
+  expect(price?.total_price).toBe(0.042)
+})
+
+it('prices the dated Grok multi-agent id at its published long-context rate', () => {
+  const options = { providerId: 'x-ai', timestamp: new Date('2026-10-17T00:00:00Z') }
+  const usage = { input_tokens: 200_000, output_tokens: 1_000_000 }
+  const dated = calcPrice(usage, 'grok-4.20-multi-agent-0309', options)
+  expect(dated?.model.id).toBe('grok-4.20-multi-agent-0309')
+  expect(dated?.total_price).toBeCloseTo(5.5, 12)
+  expect(calcPrice(usage, 'grok-4.20-multi-agent-0309', { ...options, priceContext: { processing: 'batch' } })?.total_price).toBeCloseTo(
+    4.4,
+    12
+  )
+  for (const alias of ['grok-4.20-multi-agent-beta-0309', 'grok-4.20-multi-agent-latest']) {
+    expect(calcPrice(usage, alias, options)?.model.id).toBe('grok-4.20-multi-agent-0309')
+  }
+  const bare = calcPrice(usage, 'grok-4.20-multi-agent', options)
+  expect(bare?.model.id).toBe('grok-4.20-multi-agent-0309')
+  expect(bare?.total_price).toBeCloseTo(5.5, 12)
+})
+
+it.each([
+  ['grok-4.20', '2026-04-29', 12.8],
+  ['grok-4.20', '2026-04-30', 5.5],
+  ['grok-4.20-multi-agent', '2026-04-29', 12.8],
+  ['grok-4.20-multi-agent', '2026-04-30', 5.5],
+])('prices %s on %s across the Grok 4.20 price cut', (model, day, total) => {
+  const usage = { input_tokens: 200_000, output_tokens: 1_000_000 }
+  expect(calcPrice(usage, model, { providerId: 'x-ai', timestamp: new Date(`${day}T00:00:00Z`) })?.total_price).toBeCloseTo(total, 12)
+})

@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import re
 import subprocess
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
 from .build import load_units
-from .prices_types import ModelPrice, providers_schema as build_providers_schema
+from .prices_types import ModelPrice, PriceVariant, TimeOfDateConstraint, providers_schema as build_providers_schema
 from .utils import package_dir as this_package_dir, root_dir
 
 if TYPE_CHECKING:
@@ -21,6 +22,8 @@ def package_data():
     provider_data = _load_provider_data(this_package_dir / 'new_data' / 'v2' / 'data.json')
     units = load_units()
     package_python_data(provider_data, units)
+    package_go_data(provider_data, units)
+    package_rust_data(provider_data, units)
     package_ts_data(provider_data, units)
 
 
@@ -33,6 +36,7 @@ def package_python_data(provider_data: Any, units: dict[str, Any]):
     build_providers = build_providers_schema.validate_python(provider_data)
     validate_provider_model_prices(build_providers, registry)
     validate_provider_extractor_destinations(build_providers, registry)
+    validate_provider_extractor_reasoning_coverage(build_providers)
     providers = runtime_types._providers_from_raw(provider_data, registry)  # pyright: ignore[reportPrivateUsage]
 
     provider_data_content = f'''\
@@ -83,7 +87,7 @@ def _format_generated_python_data(path: Path, *, post_process_provider_reprs: bo
     if post_process_provider_reprs:
         data_content = path.read_text()
         data_content = re.sub('^ +[a-z_]+=None,$', '', data_content, flags=re.M)
-        data_content = re.sub(r'TzInfo\((?:UTC|0)\)', 'datetime.timezone.utc', data_content)
+        data_content = re.sub(r'TzInfo\((?:UTC|0)\)', 'datetime.UTC', data_content)
         path.write_text(data_content)
 
     subprocess.run(
@@ -111,23 +115,81 @@ def load_unit_registry(units: dict[str, Any]) -> UnitRegistry:
 
 
 def validate_provider_model_prices(providers: Iterable[object], registry: UnitRegistry) -> None:
+    from genai_prices.types import PriceVariant as RuntimePriceVariant, TimeOfDateConstraint as RuntimeTimeConstraint
     from genai_prices.validation import validate_model_price
 
     for provider in providers:
         provider_id = cast(str, getattr(provider, 'id'))
         for model in cast(Iterable[object], getattr(provider, 'models')):
             model_id = cast(str, getattr(model, 'id'))
-            for label, model_price in _iter_model_prices(getattr(model, 'prices')):
+            standard_prices = list(_iter_model_prices(getattr(model, 'prices')))
+            for label, model_price in standard_prices:
                 try:
                     validate_model_price(_collect_model_price_keys(model_price), registry)
                 except ValueError as exc:
                     raise ValueError(f'Invalid model price for {provider_id}/{model_id}{label}: {exc}') from exc
+            variants = cast(list[PriceVariant | RuntimePriceVariant] | None, getattr(model, 'price_variants', None))
+            for index, variant in enumerate(variants or ()):
+                current_keys = _collect_model_price_keys(variant.prices)
+                combinations = [current_keys]
+                for previous in (variants or ())[:index]:
+                    if any(key in previous.when and previous.when[key] != value for key, value in variant.when.items()):
+                        continue
+                    intervals = [
+                        RuntimeTimeConstraint(constraint.start_time, constraint.end_time)
+                        for constraint in (previous.constraint, variant.constraint)
+                        if isinstance(constraint, TimeOfDateConstraint | RuntimeTimeConstraint)
+                    ]
+                    if intervals and not any(
+                        all(interval.active(timestamp) for interval in intervals)
+                        for timestamp in (
+                            datetime.combine(
+                                date(1970, 1, 1), interval.start_time, interval.start_time.tzinfo or UTC
+                            ).astimezone(UTC)
+                            for interval in intervals
+                        )
+                    ):
+                        continue
+                    combinations.append(current_keys | _collect_model_price_keys(previous.prices))
+                for label, model_price in standard_prices:
+                    for override_keys in combinations:
+                        try:
+                            validate_model_price(_collect_model_price_keys(model_price) | override_keys, registry)
+                        except ValueError as exc:
+                            raise ValueError(
+                                f'Invalid price variant for {provider_id}/{model_id}.price_variants[{index}] over {label}: {exc}'
+                            ) from exc
 
 
 def validate_provider_extractor_destinations(providers: Iterable[object], registry: UnitRegistry) -> None:
     from genai_prices.validation import validate_extractor_destinations
 
     reported_usage_keys = registry._reported_usage_keys  # pyright: ignore[reportPrivateUsage]
+    for provider_id, api_flavor, extractor in _iter_provider_extractors(providers):
+        dest_keys = {
+            cast(str, getattr(mapping, 'dest')) for mapping in cast(Iterable[object], getattr(extractor, 'mappings'))
+        }
+        try:
+            validate_extractor_destinations(dest_keys, reported_usage_keys)
+        except ValueError as exc:
+            raise ValueError(f'Invalid extractor destination for {provider_id}/{api_flavor}: {exc}') from exc
+
+
+def validate_provider_extractor_reasoning_coverage(providers: Iterable[object]) -> None:
+    from genai_prices.validation import validate_extractor_reasoning_coverage
+
+    for provider_id, api_flavor, extractor in _iter_provider_extractors(providers):
+        mappings = list(cast(Iterable[object], getattr(extractor, 'mappings')))
+        source_paths = [cast('str | Sequence[object]', getattr(mapping, 'path')) for mapping in mappings]
+        dest_keys = {cast(str, getattr(mapping, 'dest')) for mapping in mappings}
+        try:
+            validate_extractor_reasoning_coverage(source_paths, dest_keys)
+        except ValueError as exc:
+            raise ValueError(f'Invalid extractor for {provider_id}/{api_flavor}: {exc}') from exc
+
+
+def _iter_provider_extractors(providers: Iterable[object]) -> Iterator[tuple[str, object, object]]:
+    """Yield `(provider_id, api_flavor, extractor)` for every extractor of every provider."""
     for provider in providers:
         provider_id = cast(str, getattr(provider, 'id'))
         extractors = getattr(provider, 'extractors', None)
@@ -135,15 +197,7 @@ def validate_provider_extractor_destinations(providers: Iterable[object], regist
             continue
 
         for index, extractor in enumerate(cast(Iterable[object], extractors)):
-            dest_keys = {
-                cast(str, getattr(mapping, 'dest'))
-                for mapping in cast(Iterable[object], getattr(extractor, 'mappings'))
-            }
-            try:
-                validate_extractor_destinations(dest_keys, reported_usage_keys)
-            except ValueError as exc:
-                api_flavor = getattr(extractor, 'api_flavor', index)
-                raise ValueError(f'Invalid extractor destination for {provider_id}/{api_flavor}: {exc}') from exc
+            yield provider_id, getattr(extractor, 'api_flavor', index), extractor
 
 
 def _iter_model_prices(prices: object) -> Iterator[tuple[str, object]]:
@@ -162,7 +216,7 @@ def _collect_model_price_keys(model_price: object) -> set[str]:
         extra_keys = {field_name for field_name, value in (model_price.model_extra or {}).items() if value is not None}
         return declared_keys | extra_keys
 
-    raise TypeError(f'Unsupported model price type: {type(model_price).__name__}')
+    raise TypeError(f'Unsupported model price type: {type(model_price).__name__}')  # pragma: no cover
 
 
 def package_ts_data(provider_data: JsonData, units: dict[str, Any]):
@@ -217,6 +271,121 @@ def _runtime_unit_data(units: Mapping[str, Mapping[str, Any]]) -> dict[str, dict
     return runtime_units
 
 
+def package_go_data(provider_data: JsonData, units: Mapping[str, Mapping[str, Any]]) -> None:
+    """Generate the data bundled by the Go package."""
+    go_package_dir = root_dir / 'packages' / 'go'
+    go_data_dir = go_package_dir / 'internal' / 'data'
+    go_data_dir.mkdir(parents=True, exist_ok=True)
+
+    prices_json = go_data_dir / 'prices.json'
+    prices_json.write_text(json.dumps(provider_data, ensure_ascii=False, separators=(',', ':')) + '\n')
+
+    constants: list[str] = []
+    entries: list[str] = []
+    for usage_key, unit in sorted(units.items()):
+        identifier = _go_usage_key_identifier(usage_key)
+        constants.append(
+            f'// {identifier} identifies the {usage_key} usage value.\n'
+            f'\t{identifier} UsageKey = {json.dumps(usage_key)}'
+        )
+        price_key = cast(str, unit.get('price_key', usage_key))
+        dimensions = cast(Mapping[str, str], unit['dimensions'])
+        dimension_entries = ', '.join(
+            f'{json.dumps(key)}: {json.dumps(value)}' for key, value in sorted(dimensions.items())
+        )
+        entries.append(
+            f'\t{identifier}: {{priceKey: {json.dumps(price_key)}, per: {unit["per"]}, '
+            f'dimensions: map[string]string{{{dimension_entries}}}}},'
+        )
+
+    go_content = f"""\
+// Code generated by `make package-data`. DO NOT EDIT.
+
+package genai_prices
+
+const (
+{chr(10).join(constants)}
+)
+
+var bundledUnits = map[UsageKey]unitDef{{
+{chr(10).join(entries)}
+}}
+"""
+    data_units_go = go_package_dir / 'data_units.go'
+    data_units_go.write_text(go_content)
+    subprocess.run(['gofmt', '-w', str(data_units_go)], cwd=str(root_dir), check=True, stdout=subprocess.PIPE)
+
+    print(f'Data successfully written to {prices_json.relative_to(root_dir)}')
+    print(f'Data successfully written to {data_units_go.relative_to(root_dir)}')
+
+
+def _go_usage_key_identifier(usage_key: str) -> str:
+    parts: list[str] = []
+    for part in usage_key.split('_'):
+        if not part:
+            parts.append('_')
+        elif part[0].isdigit():
+            parts.append(part.upper())
+        else:
+            parts.append(part[0].upper() + part[1:])
+    return 'Usage' + ''.join(parts)
+
+
+def package_rust_data(provider_data: JsonData, units: Mapping[str, Mapping[str, Any]]) -> None:
+    """Generate the data bundled by the Rust crate."""
+    if len({usage_key.upper() for usage_key in units}) != len(units):
+        raise ValueError('usage keys must stay unique when uppercased into Rust constant names')
+    rust_package_dir = root_dir / 'packages' / 'rust'
+    rust_data_dir = rust_package_dir / 'data'
+    rust_data_dir.mkdir(parents=True, exist_ok=True)
+
+    prices_json = rust_data_dir / 'prices.json'
+    prices_json.write_text(json.dumps(provider_data, ensure_ascii=False, separators=(',', ':')) + '\n')
+
+    constants: list[str] = []
+    entries: list[str] = []
+    for usage_key, unit in sorted(units.items()):
+        constants.append(
+            f'    /// Identifies the `{usage_key}` usage value.\n'
+            f'    pub const {usage_key.upper()}: UsageKey = UsageKey::from_static({json.dumps(usage_key)});'
+        )
+        price_key = cast(str, unit.get('price_key', usage_key))
+        dimensions = cast(Mapping[str, str], unit['dimensions'])
+        dimension_entries = ', '.join(
+            f'({json.dumps(key, ensure_ascii=False)}, {json.dumps(value, ensure_ascii=False)})'
+            for key, value in sorted(dimensions.items())
+        )
+        entries.append(
+            f'    UnitDef {{ usage_key: {json.dumps(usage_key)}, price_key: {json.dumps(price_key)}, '
+            f'per: {float(unit["per"])!r}, dimensions: &[{dimension_entries}] }},'
+        )
+
+    rust_content = f"""\
+// @generated by `make package-data`. DO NOT EDIT.
+#![allow(clippy::unreadable_literal)]
+
+use crate::units::UnitDef;
+use crate::usage::UsageKey;
+
+impl UsageKey {{
+{chr(10).join(constants)}
+}}
+
+/// The number of registered units, so per-unit state can live in fixed-size arrays.
+pub(crate) const UNIT_COUNT: usize = {len(entries)};
+
+pub(crate) static BUNDLED_UNITS: [UnitDef; UNIT_COUNT] = [
+{chr(10).join(entries)}
+];
+"""
+    data_units_rs = rust_package_dir / 'src' / 'data_units.rs'
+    data_units_rs.parent.mkdir(parents=True, exist_ok=True)
+    data_units_rs.write_text(rust_content)
+
+    print(f'Data successfully written to {prices_json.relative_to(root_dir)}')
+    print(f'Data successfully written to {data_units_rs.relative_to(root_dir)}')
+
+
 def fix_ts_constraints(json_data: JsonData) -> None:
     """Fix constraints in ConditionalPrice objects."""
     if isinstance(json_data, list):
@@ -225,10 +394,10 @@ def fix_ts_constraints(json_data: JsonData) -> None:
     elif isinstance(json_data, dict):
         # Fix constraints in ConditionalPrice
         if constraint := json_data.get('constraint'):
-            if isinstance(constraint, dict) and 'type' not in constraint:
+            if isinstance(constraint, dict) and 'type' not in constraint:  # pragma: no branch
                 if 'start_date' in constraint:
                     constraint['type'] = 'start_date'
-                elif 'start_time' in constraint and 'end_time' in constraint:
+                elif 'start_time' in constraint and 'end_time' in constraint:  # pragma: no branch
                     constraint['type'] = 'time_of_date'
 
         # Recurse into nested objects

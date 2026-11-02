@@ -1,10 +1,11 @@
-from datetime import datetime, timezone
+import re
+from datetime import UTC, date, datetime, time, timedelta, timezone
 from decimal import Decimal
 
 import pytest
 from inline_snapshot import snapshot
 
-from genai_prices import Usage, calc_price
+from genai_prices import Usage, calc_price, extract_usage
 from genai_prices.data import providers
 from genai_prices.data_snapshot import DataSnapshot, get_snapshot, set_custom_snapshot
 from genai_prices.types import (
@@ -15,15 +16,19 @@ from genai_prices.types import (
     ClauseOr,
     ClauseRegex,
     ClauseStartsWith,
+    ConditionalPrice,
     MatchLogic,
     ModelInfo,
     ModelPrice,
+    PriceCalculation,
     Provider,
+    StartDateConstraint,
     Tier,
     TieredPrices,
-    calc_mtok_price,
+    TimeOfDateConstraint,
     calc_unit_price,
 )
+from genai_prices.units import UnitDef, UnitRegistry, _get_registry
 
 pytestmark = pytest.mark.anyio
 
@@ -39,10 +44,458 @@ def test_sync_success_with_provider():
     assert price.auto_update_timestamp is None
 
 
+def test_october_model_prices_and_context_metadata():
+    usage = Usage(input_tokens=1_000_000, cache_read_tokens=100_000, output_tokens=1_000_000, web_searches=1)
+    meta_price = calc_price(
+        usage,
+        'muse-wonder-1.0',
+        provider_api_url='https://api.meta.ai/v1',
+        genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC),
+    )
+    assert meta_price.provider.id == 'meta'
+    assert meta_price.model.context_window == 1_048_576
+    assert meta_price.total_price == Decimal('23.6225')
+
+    mistral_price = calc_price(
+        Usage(input_tokens=1_000_000, cache_read_tokens=100_000, output_tokens=1_000_000),
+        'mistral-large-4-0',
+        provider_id='mistral',
+        genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC),
+    )
+    assert mistral_price.model.id == 'mistral-large-4'
+    assert mistral_price.model.context_window == 1_048_576
+    assert mistral_price.total_price == Decimal('2.709')
+
+    openrouter_mistral = calc_price(
+        Usage(input_tokens=1_000_000, cache_read_tokens=100_000, output_tokens=1_000_000),
+        'mistralai/mistral-large-4-0-20261006',
+        provider_id='openrouter',
+        genai_request_timestamp=datetime(2026, 10, 17),
+    )
+    assert openrouter_mistral.model.context_window is None
+    assert openrouter_mistral.total_price == Decimal('2.709')
+    eu_price = calc_price(
+        Usage(input_tokens=1_000_000, cache_read_tokens=100_000, output_tokens=1_000_000),
+        'mistralai/mistral-large-4-0',
+        provider_id='openrouter',
+        price_context={'route': 'mistral/eu'},
+        genai_request_timestamp=datetime(2026, 10, 17),
+    )
+    assert eu_price.total_price == Decimal('2.9799')
+
+    openrouter_meta = calc_price(
+        usage, 'meta/muse-wonder-20261012', provider_id='openrouter', genai_request_timestamp=datetime(2026, 10, 17)
+    )
+    assert openrouter_meta.model.context_window == 1_048_576
+    assert openrouter_meta.total_price == Decimal('23.6225')
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'provider_id', 'expected_model_id', 'expected_total'),
+    [
+        # Standard mode: 0.9M uncached x $1.25 + 0.1M cached x $0.15 + 1M out x $4.25 + 1 search x $0.0025
+        ('muse-spark-1.1', 'meta', 'muse-spark-1.1', Decimal('5.3925')),
+        ('muse-spark-1.2', 'meta', 'muse-spark-1.2', Decimal('5.3925')),
+        ('muse-spark-1.3', 'meta', 'muse-spark-1.3', Decimal('5.3925')),
+        # Contributor mode: 0.9M x $0.10 + 0.1M x $0.002 + 1M x $0.20 + 1 search x $0.0025
+        ('muse-spark-1.2-contributor', 'meta', 'muse-spark-1.2-contributor', Decimal('0.2927')),
+        ('muse-spark-1.3-contributor', 'meta', 'muse-spark-1.3-contributor', Decimal('0.2927')),
+        # Provider inferred from the model ID alone.
+        ('muse-spark-1.3', None, 'muse-spark-1.3', Decimal('5.3925')),
+        ('meta/muse-spark-1.3-20260902', 'openrouter', 'meta/muse-spark-1.3', Decimal('5.3925')),
+        (
+            'meta/muse-spark-1.3-contributor-20260902',
+            'openrouter',
+            'meta/muse-spark-1.3-contributor',
+            Decimal('0.2927'),
+        ),
+    ],
+)
+def test_muse_spark_standard_and_contributor_prices(
+    model_ref: str, provider_id: str | None, expected_model_id: str, expected_total: Decimal
+):
+    usage = Usage(input_tokens=1_000_000, cache_read_tokens=100_000, output_tokens=1_000_000, web_searches=1)
+    price = calc_price(
+        usage, model_ref, provider_id=provider_id, genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC)
+    )
+    assert price.model.id == expected_model_id
+    assert price.model.context_window == 1_048_576
+    assert price.total_price == expected_total
+
+
+def test_openai_decisions_price_and_usage_extraction():
+    pinned = datetime(2026, 10, 18, tzinfo=UTC)
+    decisions_usage = Usage(input_tokens=1_000, cache_read_tokens=200, output_tokens=100)
+    decisions_price = calc_price(
+        decisions_usage, model_ref='gpt-6-luna', provider_id=' OPENAI-DECISIONS ', genai_request_timestamp=pinned
+    )
+    openai_price = calc_price(
+        decisions_usage, model_ref='gpt-6-luna', provider_id='openai', genai_request_timestamp=pinned
+    )
+
+    assert decisions_price.provider.id == 'openai-decisions'
+    assert decisions_price.total_price == Decimal('0.000100')
+    assert openai_price.total_price == Decimal('0.000132')
+    shared_url_price = calc_price(
+        Usage(input_tokens=1),
+        model_ref='gpt-6-luna',
+        provider_api_url='https://api.openai.com/v1/decisions',
+    )
+    assert shared_url_price.provider.id == 'openai'
+
+    for api_flavor in ('default', 'responses'):
+        extracted = extract_usage(
+            {
+                'model': 'gpt-6-luna',
+                'usage': {
+                    'input_tokens': 1_000,
+                    'input_tokens_details': {'cached_tokens': 200, 'cache_write_tokens': 50},
+                    'output_tokens': 100,
+                    'output_tokens_details': {'reasoning_tokens': 25},
+                },
+            },
+            provider_id='openai-decisions',
+            api_flavor=api_flavor,
+        )
+        assert extracted.model is not None
+        assert extracted.model.id == 'gpt-6-luna'
+        assert extracted.usage == Usage(
+            input_tokens=1_000,
+            cache_read_tokens=200,
+            cache_write_tokens=50,
+            output_tokens=100,
+            output_reasoning_tokens=25,
+        )
+        assert calc_price(
+            extracted.usage,
+            model_ref=extracted.model.id,
+            provider_id='openai-decisions',
+            genai_request_timestamp=pinned,
+        ).total_price == Decimal('0.000100')
+
+    for input_tokens, expected in ((272_000, Decimal('0.0272')), (272_001, Decimal('0.0544002'))):
+        tier_price = calc_price(
+            Usage(input_tokens=input_tokens, cache_read_tokens=100_000, cache_write_tokens=50_000),
+            model_ref='gpt-6-luna',
+            provider_id='openai-decisions',
+            genai_request_timestamp=pinned,
+        )
+        assert tier_price.total_price == expected
+
+    with pytest.raises(LookupError, match="Unable to find model with model_ref='gpt-6-sol'"):
+        calc_price(Usage(input_tokens=1), model_ref='gpt-6-sol', provider_id='openai-decisions')
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'expected_total_price'),
+    [
+        ('composer-2.5', Decimal('3.2')),
+        ('composer-2.5-fast', Decimal('18.5')),
+        ('grok-4.5', Decimal('8.5')),
+        ('grok-4.5-fast', Decimal('23')),
+        ('grok-4.6', Decimal('8.5')),
+        ('grok-4.6-fast', Decimal('17')),
+    ],
+)
+def test_cursor_model_prices(model_ref: str, expected_total_price: Decimal):
+    price = calc_price(
+        Usage(input_tokens=2_000_000, cache_read_tokens=1_000_000, output_tokens=1_000_000),
+        model_ref=model_ref,
+        provider_id='cursor',
+    )
+
+    assert price.total_price == expected_total_price
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'input_tokens', 'expected_total_price'),
+    [
+        ('grok-4.7', 256_000, Decimal('6.362')),
+        ('grok-4.7', 256_001, Decimal('12.724004')),
+        ('grok-4.7-fast', 256_000, Decimal('12.724')),
+        ('grok-4.7-fast', 256_001, Decimal('19.086006')),
+    ],
+)
+def test_cursor_grok_4_7_long_context_prices(model_ref: str, input_tokens: int, expected_total_price: Decimal) -> None:
+    price = calc_price(
+        Usage(input_tokens=input_tokens, cache_read_tokens=100_000, output_tokens=1_000_000),
+        model_ref=model_ref,
+        provider_id='cursor',
+    )
+
+    assert price.total_price == expected_total_price
+    assert price.model.context_window == 500_000
+
+
+def test_cursor_provider_inference():
+    composer_price = calc_price(Usage(input_tokens=1), model_ref='composer-2.5[fast=true]')
+    grok_price = calc_price(
+        Usage(input_tokens=1),
+        model_ref='grok-4.6[fast=false]',
+        provider_api_url='https://api.cursor.com/v1/agents',
+    )
+
+    assert composer_price.provider.id == 'cursor'
+    assert composer_price.model.id == 'composer-2.5-fast'
+    assert grok_price.provider.id == 'cursor'
+    assert grok_price.model.id == 'grok-4.6'
+
+
+ELEVENLABS_USAGE = Usage(audio_seconds=60, input_tokens=1_000_000, cache_read_tokens=500_000, output_tokens=1_000_000)
+ELEVENLABS_TIMESTAMP = datetime(2026, 10, 22, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'expected_total_price'),
+    [
+        ('eleven_realtime_v1_max', Decimal('10.07')),
+        ('eleven_realtime_v1_mini', Decimal('6.28')),
+        ('ELEVEN_REALTIME_V1_MAX', Decimal('10.07')),
+    ],
+)
+def test_elevenlabs_realtime_prices(model_ref: str, expected_total_price: Decimal):
+    by_provider_id = calc_price(
+        ELEVENLABS_USAGE, model_ref, provider_id='elevenlabs', genai_request_timestamp=ELEVENLABS_TIMESTAMP
+    )
+    by_model_namespace = calc_price(ELEVENLABS_USAGE, model_ref, genai_request_timestamp=ELEVENLABS_TIMESTAMP)
+
+    for price in (by_provider_id, by_model_namespace):
+        assert price.provider.id == 'elevenlabs'
+        assert price.total_price == expected_total_price
+
+
+@pytest.mark.parametrize(
+    'provider_api_url',
+    [
+        'https://api.elevenlabs.io',
+        'https://api.us.elevenlabs.io/v1/convai',
+        'https://api.eu.residency.elevenlabs.io/v1/convai',
+        'https://api.in.residency.elevenlabs.io/v1/convai',
+        'https://api.sg.residency.elevenlabs.io/v1/convai',
+    ],
+)
+def test_elevenlabs_realtime_selected_by_api_url(provider_api_url: str):
+    price = calc_price(
+        ELEVENLABS_USAGE,
+        'eleven_realtime_v1_max',
+        provider_api_url=provider_api_url,
+        genai_request_timestamp=ELEVENLABS_TIMESTAMP,
+    )
+
+    assert price.provider.id == 'elevenlabs'
+    assert price.total_price == Decimal('10.07')
+
+
+@pytest.mark.parametrize(
+    'provider_api_url',
+    ['https://api.elevenlabs.io.evil.example/v1', 'https://api.elevenlabs.ioevil.example/v1'],
+)
+def test_elevenlabs_api_url_requires_the_real_host(provider_api_url: str):
+    with pytest.raises(LookupError, match='Unable to find provider'):
+        calc_price(Usage(input_tokens=1), 'eleven_realtime_v1_max', provider_api_url=provider_api_url)
+
+
+def test_elevenlabs_does_not_price_other_models_in_its_namespace():
+    with pytest.raises(LookupError, match='Unable to find model'):
+        calc_price(Usage(input_tokens=1), 'eleven_multilingual_v2', provider_id='elevenlabs')
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'expected_total_price'),
+    [
+        ('claude-fable-5', Decimal('61')),
+        ('claude-fable-5.1', Decimal('60.25')),
+        ('claude-haiku-4.5', Decimal('6.10')),
+        ('claude-opus-4.8-fast', Decimal('61')),
+        ('claude-opus-5.5', Decimal('24.2')),
+        ('claude-sonnet-4.6', Decimal('18.3')),
+        ('claude-sonnet-5', Decimal('12.2')),
+        ('claude-sonnet-5.5', Decimal('12.1')),
+        ('gemini-3.6-flash', Decimal('4.575')),
+        ('gpt-5-mini', Decimal('2.275')),
+        ('gpt-5.4-nano', Decimal('1.47')),
+        ('gpt-6-astra', Decimal('97')),
+        ('gpt-6.1-sol', Decimal('19.2')),
+        ('grok-4.7', Decimal('17')),
+        ('kimi-k3', Decimal('18.3')),
+        ('mai-code-1.1-flash', Decimal('1.42')),
+    ],
+)
+def test_github_copilot_model_prices(model_ref: str, expected_total_price: Decimal):
+    price = calc_price(
+        Usage(input_tokens=2_000_000, cache_read_tokens=1_000_000, output_tokens=1_000_000),
+        model_ref=model_ref,
+        provider_id='github-copilot',
+        genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC),
+    )
+
+    assert price.model.id == model_ref
+    assert price.total_price == expected_total_price
+
+
+@pytest.mark.parametrize(
+    ('input_tokens', 'expected_total_price'),
+    [
+        (200_000, Decimal('0.04125')),
+        (200_001, Decimal('0.0819004')),
+    ],
+)
+def test_github_copilot_long_context_tier(input_tokens: int, expected_total_price: Decimal):
+    """Copilot's long-context rates reprice the whole request once the prompt crosses the threshold."""
+    price = calc_price(
+        Usage(input_tokens=input_tokens, cache_write_tokens=1_000, output_tokens=1_000),
+        model_ref='gpt-5.6-luna',
+        provider_id='github-copilot',
+        genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC),
+    )
+
+    assert price.total_price == expected_total_price
+
+
+def test_github_copilot_included_model_is_free():
+    price = calc_price(
+        Usage(input_tokens=1_000_000, output_tokens=1_000_000),
+        model_ref='gpt-4.1-2025-04-14',
+        provider_id='github-copilot',
+    )
+
+    assert price.model.id == 'gpt-4.1'
+    assert price.model.context_window == 128000
+    assert price.total_price == Decimal(0)
+
+
+def test_github_copilot_provider_inference():
+    by_alias = calc_price(Usage(input_tokens=1), model_ref='claude-haiku-4.5', provider_id='copilot')
+    by_api_url = calc_price(
+        Usage(input_tokens=1),
+        model_ref='gpt-5.4-2026-03-05',
+        provider_api_url='https://api.githubcopilot.com/responses',
+    )
+
+    assert by_alias.provider.id == 'github-copilot'
+    assert by_alias.model.id == 'claude-haiku-4.5'
+    assert by_api_url.provider.id == 'github-copilot'
+    assert by_api_url.model.id == 'gpt-5.4'
+
+
+def test_github_copilot_does_not_claim_vendor_namespaces():
+    """Copilot resells IDs that other providers own, so it must never win a bare model lookup."""
+    snapshot_data = get_snapshot()
+
+    assert snapshot_data.find_provider('claude-haiku-4.5', None, None).id == 'anthropic'
+    assert snapshot_data.find_provider('gemini-3.6-flash', None, None).id == 'google'
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'expected_total_price'),
+    [
+        ('deepseek/deepseek-v4-flash-latest', Decimal('0.448')),
+        ('deepseek/deepseek-v4-pro', Decimal('5.42')),
+        ('moonshotai/kimi-k3', Decimal('18.3')),
+        ('thinkingmachines/inkling-small', Decimal('1.8')),
+        ('trinity-large-thinking', Decimal('1.11')),
+        ('zai-org/glm-5.2', Decimal('6.06')),
+    ],
+)
+def test_arcee_model_prices(model_ref: str, expected_total_price: Decimal) -> None:
+    price = calc_price(
+        Usage(input_tokens=2_000_000, cache_read_tokens=1_000_000, output_tokens=1_000_000),
+        model_ref=model_ref,
+        provider_id='arcee',
+    )
+
+    assert price.total_price == expected_total_price
+
+
+def test_arcee_provider_inference() -> None:
+    explicit_price = calc_price(Usage(input_tokens=1), model_ref='trinity-large-thinking', provider_id='arcee')
+    url_price = calc_price(
+        Usage(input_tokens=1),
+        model_ref='deepseek/deepseek-v4-pro',
+        provider_api_url='https://api.arcee.ai/api/v1/chat/completions',
+    )
+
+    assert explicit_price.provider.id == 'arcee'
+    assert url_price.provider.id == 'arcee'
+
+    with pytest.raises(LookupError, match='in deepseek'):
+        calc_price(Usage(input_tokens=1), model_ref='deepseek/deepseek-v4-pro')
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'expected_total_price'),
+    [
+        ('databricks-kimi-k3', Decimal('18.3')),
+        ('databricks-deepseek-v4-flash-0731', Decimal('0.448')),
+        ('databricks-deepseek-v4-pro-0813', Decimal('5.412')),
+        ('system.ai.glm-5-3', Decimal('6.06')),
+        ('databricks-qwen35-122b-a10b', Decimal('2.64')),
+        ('databricks-gpt-oss-120b', Decimal('0.9')),
+    ],
+)
+def test_databricks_model_prices(model_ref: str, expected_total_price: Decimal) -> None:
+    price = calc_price(
+        Usage(input_tokens=2_000_000, cache_read_tokens=1_000_000, output_tokens=1_000_000),
+        model_ref=model_ref,
+        provider_id='databricks',
+        genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC),
+    )
+
+    assert price.total_price == expected_total_price
+
+
+@pytest.mark.parametrize(
+    'provider_api_url',
+    [
+        'https://my-workspace.cloud.databricks.com/serving-endpoints/chat/completions',
+        'https://adb-1234567890123456.7.azuredatabricks.net/serving-endpoints/databricks-gpt-oss-120b/invocations',
+        'https://1234567890123456.7.gcp.databricks.com/ai-gateway/mlflow/v1/chat/completions',
+    ],
+)
+def test_databricks_api_url(provider_api_url: str) -> None:
+    price = calc_price(
+        Usage(input_tokens=1_000_000),
+        model_ref='databricks-gpt-oss-120b',
+        provider_api_url=provider_api_url,
+        genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC),
+    )
+
+    assert price.provider.id == 'databricks'
+    assert price.total_price == Decimal('0.15')
+
+
+@pytest.mark.parametrize(
+    'provider_api_url',
+    [
+        'https://my-workspace.cloud.databricks.com.evil.test/serving-endpoints/chat/completions',
+        'https://adb-1234567890123456.7.azuredatabricks.net.evil.test/serving-endpoints/databricks-gpt-oss-120b/invocations',
+        'https://1234567890123456.7.gcp.databricks.com.evil.test/ai-gateway/mlflow/v1/chat/completions',
+        'https://my-workspace.cloud.databricks.com/api/2.0/clusters/list',
+    ],
+)
+def test_databricks_api_url_rejects_other_hosts_and_paths(provider_api_url: str) -> None:
+    with pytest.raises(LookupError, match='Unable to find provider provider_api_url='):
+        calc_price(Usage(input_tokens=1), model_ref='databricks-gpt-oss-120b', provider_api_url=provider_api_url)
+
+
+def test_databricks_provider_inference() -> None:
+    snapshot_data = get_snapshot()
+
+    assert snapshot_data.find_provider('databricks-gpt-oss-120b', None, None).id == 'databricks'
+    assert snapshot_data.find_provider('system.ai.kimi-k3', None, None).id == 'databricks'
+    assert snapshot_data.find_provider('kimi-k3', None, None).id == 'moonshotai'
+
+    litellm_price = calc_price(
+        Usage(input_tokens=1), model_ref='databricks/databricks-gpt-oss-120b', provider_id='litellm'
+    )
+    assert litellm_price.provider.id == 'databricks'
+    assert litellm_price.model.id == 'databricks-gpt-oss-120b'
+
+
 @pytest.mark.parametrize(
     ('model_ref', 'expected_input_price'),
     [
-        ('gpt-5.6-sol', Decimal('0.00625')),
+        ('gpt-5.6-sol', Decimal('0.005')),
         ('gpt-5.6-terra', Decimal('0.0025')),
         ('gpt-5.6-luna', Decimal('0.00025')),
     ],
@@ -62,7 +515,7 @@ def test_gpt_5_6_cache_write_price(model_ref: str, expected_input_price: Decimal
 @pytest.mark.parametrize(
     ('model_ref', 'short_write_rate', 'long_write_rate'),
     [
-        ('gpt-5.6-sol', Decimal('6.25'), Decimal('12.5')),
+        ('gpt-5.6-sol', Decimal('5'), Decimal('10')),
         ('gpt-5.6-terra', Decimal('2.5'), Decimal('5')),
         ('gpt-5.6-luna', Decimal('0.25'), Decimal('0.5')),
     ],
@@ -86,9 +539,71 @@ def test_gpt_5_6_cache_write_price_context_boundary(
 
 
 @pytest.mark.parametrize(
+    ('audio_seconds', 'total'),
+    [(60, Decimal('0.05')), (3_600, Decimal('3')), (90, Decimal('0.075'))],
+)
+def test_gpt_live_1_prices_session_duration(audio_seconds: int, total: Decimal):
+    """GPT-Live bills the voice session by the second, one rate for input and output audio."""
+    price = calc_price(Usage(audio_seconds=audio_seconds), model_ref='gpt-live-1', provider_id='openai')
+
+    assert price.model.id == 'gpt-live-1'
+    assert price.total_price == total
+
+
+def test_gpt_live_1_duration_is_extracted_from_live_usage():
+    """Live's `session.usage.updated` and `session.closed` report `usage.seconds`, a running total."""
+    extracted = extract_usage({'usage': {'seconds': 60.0}}, provider_id='openai', api_flavor='live')
+
+    assert extracted.usage == Usage(audio_seconds=60.0)
+    price = calc_price(extracted.usage, model_ref='gpt-live-1', provider_id='openai')
+    assert price.total_price == Decimal('0.05')
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'model_id', 'short_total', 'long_total'),
+    [
+        ('gpt-6-sol', 'gpt-6-sol', Decimal('0.4087'), Decimal('1.2124')),
+        ('gpt-6-sol-2026-09-22', 'gpt-6-sol', Decimal('0.4087'), Decimal('1.2124')),
+        ('gpt-6-luna', 'gpt-6-luna', Decimal('0.020435'), Decimal('0.06062')),
+        ('gpt-6-luna-2026-09-22', 'gpt-6-luna', Decimal('0.020435'), Decimal('0.06062')),
+    ],
+)
+def test_gpt_6_sol_luna_prices(model_ref: str, model_id: str, short_total: Decimal, long_total: Decimal):
+    for input_tokens, expected_total in ((200_000, short_total), (300_000, long_total)):
+        price = calc_price(
+            Usage(input_tokens=input_tokens, cache_read_tokens=1_000, cache_write_tokens=1_000, output_tokens=1_000),
+            model_ref=model_ref,
+            provider_id='openai',
+        )
+
+        assert price.model.id == model_id
+        assert price.model.context_window == 1_050_000
+        assert price.total_price == expected_total
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'standard_total', 'long_total'),
+    [
+        ('gpt-6-sol', Decimal('0.5527'), Decimal('1.100404')),
+        ('gpt-6.1-sol', Decimal('0.5526'), Decimal('1.100204')),
+        ('gpt-6.1-terra', Decimal('0.2763'), Decimal('0.550102')),
+        ('gpt-6-luna', Decimal('0.027635'), Decimal('0.0550202')),
+    ],
+)
+def test_gpt_6_sol_luna_long_context_boundary(model_ref: str, standard_total: Decimal, long_total: Decimal):
+    for tokens, expected_total in ((272_000, standard_total), (272_001, long_total)):
+        price = calc_price(
+            Usage(input_tokens=tokens, cache_read_tokens=1_000, cache_write_tokens=1_000, output_tokens=1_000),
+            model_ref=model_ref,
+            provider_id='openai',
+        )
+        assert price.total_price == expected_total
+
+
+@pytest.mark.parametrize(
     ('model_ref', 'input_rate', 'cache_write_rate', 'cache_read_rate', 'output_rate'),
     [
-        ('gpt-5.6-sol', Decimal('10'), Decimal('12.5'), Decimal('1'), Decimal('45')),
+        ('gpt-5.6-sol', Decimal('8'), Decimal('10'), Decimal('0.8'), Decimal('30')),
         ('gpt-5.6-terra', Decimal('4'), Decimal('5'), Decimal('0.4'), Decimal('18')),
         ('gpt-5.6-luna', Decimal('0.4'), Decimal('0.5'), Decimal('0.04'), Decimal('1.8')),
     ],
@@ -119,12 +634,68 @@ def test_gpt_5_6_long_context_mixed_price(
 
 
 @pytest.mark.parametrize(
+    ('model_ref', 'usage', 'expected_input_price', 'expected_output_price'),
+    [
+        (
+            'gpt-5.5',
+            Usage(input_tokens=272_001, cache_read_tokens=100_000, output_tokens=1_000),
+            Decimal('1.82001'),
+            Decimal('0.045'),
+        ),
+        (
+            'gpt-5.5-pro',
+            Usage(input_tokens=272_001, output_tokens=1_000),
+            Decimal('16.32006'),
+            Decimal('0.27'),
+        ),
+    ],
+)
+def test_gpt_5_5_long_context_price(
+    model_ref: str,
+    usage: Usage,
+    expected_input_price: Decimal,
+    expected_output_price: Decimal,
+) -> None:
+    price = calc_price(usage, model_ref=model_ref, provider_id='openai')
+
+    assert price.input_price == expected_input_price
+    assert price.output_price == expected_output_price
+    assert price.total_price == expected_input_price + expected_output_price
+
+
+@pytest.mark.parametrize(
     ('model_ref', 'request_timestamp', 'expected_prices'),
     [
         (
-            'gpt-5.6-luna',
-            datetime(2026, 7, 29, tzinfo=timezone.utc),
+            'gpt-5.6-sol',
+            datetime(2026, 8, 20, tzinfo=UTC),
             ModelPrice(
+                web_searches_kcount=Decimal('10'),
+                storage_searches_kcount=Decimal('2.5'),
+                input_mtok=TieredPrices(base=Decimal('5'), tiers=[Tier(start=272_000, price=Decimal('10'))]),
+                cache_write_mtok=TieredPrices(base=Decimal('6.25'), tiers=[Tier(start=272_000, price=Decimal('12.5'))]),
+                cache_read_mtok=TieredPrices(base=Decimal('0.5'), tiers=[Tier(start=272_000, price=Decimal('1'))]),
+                output_mtok=TieredPrices(base=Decimal('30'), tiers=[Tier(start=272_000, price=Decimal('45'))]),
+            ),
+        ),
+        (
+            'gpt-5.6-sol',
+            datetime(2026, 8, 21, tzinfo=UTC),
+            ModelPrice(
+                web_searches_kcount=Decimal('10'),
+                storage_searches_kcount=Decimal('2.5'),
+                input_mtok=TieredPrices(base=Decimal('4'), tiers=[Tier(start=272_000, price=Decimal('8'))]),
+                cache_write_mtok=TieredPrices(base=Decimal('5'), tiers=[Tier(start=272_000, price=Decimal('10'))]),
+                cache_read_mtok=TieredPrices(base=Decimal('0.4'), tiers=[Tier(start=272_000, price=Decimal('0.8'))]),
+                output_mtok=TieredPrices(base=Decimal('20'), tiers=[Tier(start=272_000, price=Decimal('30'))]),
+            ),
+        ),
+        (
+            'gpt-5.6-luna',
+            datetime(2026, 7, 29, tzinfo=UTC),
+            ModelPrice(
+                web_searches_kcount=Decimal('10'),
+                storage_searches_kcount=Decimal('2.5'),
                 input_mtok=TieredPrices(base=Decimal('1'), tiers=[Tier(start=272_000, price=Decimal('2'))]),
                 cache_write_mtok=TieredPrices(base=Decimal('1.25'), tiers=[Tier(start=272_000, price=Decimal('2.5'))]),
                 cache_read_mtok=TieredPrices(base=Decimal('0.1'), tiers=[Tier(start=272_000, price=Decimal('0.2'))]),
@@ -133,8 +704,10 @@ def test_gpt_5_6_long_context_mixed_price(
         ),
         (
             'gpt-5.6-luna',
-            datetime(2026, 7, 30, tzinfo=timezone.utc),
+            datetime(2026, 7, 30, tzinfo=UTC),
             ModelPrice(
+                web_searches_kcount=Decimal('10'),
+                storage_searches_kcount=Decimal('2.5'),
                 input_mtok=TieredPrices(base=Decimal('0.2'), tiers=[Tier(start=272_000, price=Decimal('0.4'))]),
                 cache_write_mtok=TieredPrices(base=Decimal('0.25'), tiers=[Tier(start=272_000, price=Decimal('0.5'))]),
                 cache_read_mtok=TieredPrices(base=Decimal('0.02'), tiers=[Tier(start=272_000, price=Decimal('0.04'))]),
@@ -143,8 +716,10 @@ def test_gpt_5_6_long_context_mixed_price(
         ),
         (
             'gpt-5.6-terra',
-            datetime(2026, 7, 29, tzinfo=timezone.utc),
+            datetime(2026, 7, 29, tzinfo=UTC),
             ModelPrice(
+                web_searches_kcount=Decimal('10'),
+                storage_searches_kcount=Decimal('2.5'),
                 input_mtok=TieredPrices(base=Decimal('2.5'), tiers=[Tier(start=272_000, price=Decimal('5'))]),
                 cache_write_mtok=TieredPrices(
                     base=Decimal('3.125'), tiers=[Tier(start=272_000, price=Decimal('6.25'))]
@@ -155,8 +730,10 @@ def test_gpt_5_6_long_context_mixed_price(
         ),
         (
             'gpt-5.6-terra',
-            datetime(2026, 7, 30, tzinfo=timezone.utc),
+            datetime(2026, 7, 30, tzinfo=UTC),
             ModelPrice(
+                web_searches_kcount=Decimal('10'),
+                storage_searches_kcount=Decimal('2.5'),
                 input_mtok=TieredPrices(base=Decimal('2'), tiers=[Tier(start=272_000, price=Decimal('4'))]),
                 cache_write_mtok=TieredPrices(base=Decimal('2.5'), tiers=[Tier(start=272_000, price=Decimal('5'))]),
                 cache_read_mtok=TieredPrices(base=Decimal('0.2'), tiers=[Tier(start=272_000, price=Decimal('0.4'))]),
@@ -174,6 +751,336 @@ def test_gpt_5_6_price_change(model_ref: str, request_timestamp: datetime, expec
     )
 
     assert price.model_price == expected_prices
+
+
+def test_gpt_6_astra_price():
+    price = calc_price(
+        Usage(input_tokens=1_000, cache_read_tokens=100, output_tokens=100),
+        model_ref='gpt-6-astra-2026-09-04',
+        provider_id='openai',
+    )
+
+    assert price.model.id == 'gpt-6-astra'
+    assert price.input_price == Decimal('0.0091')
+    assert price.output_price == Decimal('0.005')
+    assert price.total_price == Decimal('0.0141')
+
+
+def test_gpt_6_astra_long_context_boundary():
+    standard = calc_price(
+        Usage(input_tokens=272_000, output_tokens=1_000),
+        model_ref='gpt-6-astra',
+        provider_id='openai',
+    )
+    assert standard.input_price == Decimal('2.72')
+    assert standard.output_price == Decimal('0.05')
+    assert standard.total_price == Decimal('2.77')
+
+    long_context = calc_price(
+        Usage(input_tokens=272_001, output_tokens=1_000),
+        model_ref='gpt-6-astra',
+        provider_id='openai',
+    )
+    assert long_context.input_price == Decimal('5.44002')
+    assert long_context.output_price == Decimal('0.075')
+    assert long_context.total_price == Decimal('5.51502')
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'request_timestamp', 'expected_prices'),
+    [
+        (
+            'openai.gpt-5.6-sol',
+            datetime(2026, 7, 29, tzinfo=UTC),
+            ModelPrice(
+                input_mtok=TieredPrices(base=Decimal('5.5'), tiers=[Tier(start=272_000, price=Decimal('11'))]),
+                cache_write_mtok=TieredPrices(
+                    base=Decimal('6.875'), tiers=[Tier(start=272_000, price=Decimal('13.75'))]
+                ),
+                cache_read_mtok=TieredPrices(base=Decimal('0.55'), tiers=[Tier(start=272_000, price=Decimal('1.1'))]),
+                output_mtok=TieredPrices(base=Decimal('33'), tiers=[Tier(start=272_000, price=Decimal('49.5'))]),
+            ),
+        ),
+        (
+            'openai.gpt-5.6-terra',
+            datetime(2026, 7, 29, tzinfo=UTC),
+            ModelPrice(
+                input_mtok=Decimal('2.75'),
+                cache_write_mtok=Decimal('3.4375'),
+                cache_read_mtok=Decimal('0.275'),
+                output_mtok=Decimal('16.5'),
+            ),
+        ),
+        (
+            'openai.gpt-5.6-terra',
+            datetime(2026, 7, 30, tzinfo=UTC),
+            ModelPrice(
+                input_mtok=TieredPrices(base=Decimal('2.2'), tiers=[Tier(start=272_000, price=Decimal('4.4'))]),
+                cache_write_mtok=TieredPrices(base=Decimal('2.75'), tiers=[Tier(start=272_000, price=Decimal('5.5'))]),
+                cache_read_mtok=TieredPrices(base=Decimal('0.22'), tiers=[Tier(start=272_000, price=Decimal('0.44'))]),
+                output_mtok=TieredPrices(base=Decimal('13.2'), tiers=[Tier(start=272_000, price=Decimal('19.8'))]),
+            ),
+        ),
+        (
+            'openai.gpt-5.6-luna',
+            datetime(2026, 7, 29, tzinfo=UTC),
+            ModelPrice(
+                input_mtok=Decimal('1.1'),
+                cache_write_mtok=Decimal('1.375'),
+                cache_read_mtok=Decimal('0.11'),
+                output_mtok=Decimal('6.6'),
+            ),
+        ),
+        (
+            'openai.gpt-5.6-luna',
+            datetime(2026, 7, 30, tzinfo=UTC),
+            ModelPrice(
+                input_mtok=TieredPrices(base=Decimal('0.22'), tiers=[Tier(start=272_000, price=Decimal('0.44'))]),
+                cache_write_mtok=TieredPrices(
+                    base=Decimal('0.275'), tiers=[Tier(start=272_000, price=Decimal('0.55'))]
+                ),
+                cache_read_mtok=TieredPrices(
+                    base=Decimal('0.022'), tiers=[Tier(start=272_000, price=Decimal('0.044'))]
+                ),
+                output_mtok=TieredPrices(base=Decimal('1.32'), tiers=[Tier(start=272_000, price=Decimal('1.98'))]),
+            ),
+        ),
+    ],
+)
+def test_aws_gpt_5_6_price_change(model_ref: str, request_timestamp: datetime, expected_prices: ModelPrice) -> None:
+    price = calc_price(
+        Usage(input_tokens=0),
+        model_ref=model_ref,
+        provider_id='aws',
+        genai_request_timestamp=request_timestamp,
+    )
+
+    assert price.model_price == expected_prices
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'request_timestamp', 'input_rate', 'output_rate'),
+    [
+        ('openai.gpt-5.6-sol', datetime(2026, 8, 20, tzinfo=UTC), Decimal('5.5'), Decimal('33')),
+        ('openai.gpt-5.6-sol', datetime(2026, 8, 21, tzinfo=UTC), Decimal('4.4'), Decimal('22')),
+        ('global.openai.gpt-5.6-sol', datetime(2026, 8, 20, tzinfo=UTC), Decimal('5'), Decimal('30')),
+        ('global.openai.gpt-5.6-sol', datetime(2026, 8, 21, tzinfo=UTC), Decimal('4'), Decimal('20')),
+    ],
+)
+def test_aws_gpt_5_6_sol_price_cut(
+    model_ref: str, request_timestamp: datetime, input_rate: Decimal, output_rate: Decimal
+) -> None:
+    """AWS cut Sol prices on 2026-08-21; the regional and global entries both carry the dated change."""
+    price = calc_price(
+        Usage(input_tokens=1_000, output_tokens=1_000),
+        model_ref=model_ref,
+        provider_id='aws',
+        genai_request_timestamp=request_timestamp,
+    )
+
+    assert price.input_price == input_rate / 1_000
+    assert price.output_price == output_rate / 1_000
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'short_input_rate', 'long_input_rate'),
+    [
+        ('openai.gpt-5.6-sol', Decimal('4.4'), Decimal('8.8')),
+        ('openai.gpt-5.6-terra', Decimal('2.2'), Decimal('4.4')),
+        ('openai.gpt-5.6-luna', Decimal('0.22'), Decimal('0.44')),
+        ('global.openai.gpt-5.6-sol', Decimal('4'), Decimal('8')),
+        ('global.openai.gpt-5.6-terra', Decimal('2'), Decimal('4')),
+        ('global.openai.gpt-5.6-luna', Decimal('0.2'), Decimal('0.4')),
+        ('us.openai.gpt-5.6-sol', Decimal('4.4'), Decimal('8.8')),
+        ('us.openai.gpt-5.6-terra', Decimal('2.2'), Decimal('4.4')),
+        ('in.openai.gpt-5.6-luna', Decimal('0.22'), Decimal('0.44')),
+        ('gpt-5.6-sol', Decimal('4.4'), Decimal('8.8')),
+        ('gpt-5.6-terra', Decimal('2.2'), Decimal('4.4')),
+        ('gpt-5.6-luna', Decimal('0.22'), Decimal('0.44')),
+    ],
+)
+def test_aws_gpt_5_6_context_boundary(model_ref: str, short_input_rate: Decimal, long_input_rate: Decimal) -> None:
+    """AWS bills 272K input tokens or fewer at the short-context rate."""
+    for tokens, rate in ((272_000, short_input_rate), (272_001, long_input_rate)):
+        price = calc_price(
+            Usage(input_tokens=tokens),
+            model_ref=model_ref,
+            provider_id='aws',
+        )
+
+        expected_input_price = rate * tokens / 1_000_000
+        assert price.input_price == expected_input_price
+        assert price.output_price == Decimal(0)
+        assert price.total_price == expected_input_price
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'model_id', 'short_input_rate', 'long_input_rate'),
+    [
+        ('global.openai.gpt-6-astra', 'global.openai.gpt-6-astra', Decimal('10'), Decimal('20')),
+        ('global.openai.gpt-6-sol', 'global.openai.gpt-6-sol', Decimal('2'), Decimal('4')),
+        ('global.openai.gpt-6-luna', 'global.openai.gpt-6-luna', Decimal('0.1'), Decimal('0.2')),
+        ('us.openai.gpt-6-astra', 'regional.openai.gpt-6-astra', Decimal('11'), Decimal('22')),
+        ('us.openai.gpt-6-sol', 'regional.openai.gpt-6-sol', Decimal('2.2'), Decimal('4.4')),
+        ('us.openai.gpt-6-luna', 'regional.openai.gpt-6-luna', Decimal('0.11'), Decimal('0.22')),
+        ('in.openai.gpt-6-sol', 'regional.openai.gpt-6-sol', Decimal('2.2'), Decimal('4.4')),
+        ('in.openai.gpt-6-luna', 'regional.openai.gpt-6-luna', Decimal('0.11'), Decimal('0.22')),
+        ('openai.gpt-6-sol', 'regional.openai.gpt-6-sol', Decimal('2.2'), Decimal('4.4')),
+        ('gpt-6-luna', 'regional.openai.gpt-6-luna', Decimal('0.11'), Decimal('0.22')),
+        ('global.openai.gpt-6.1-sol', 'global.openai.gpt-6.1-sol', Decimal('2'), Decimal('4')),
+        ('us.openai.gpt-6.1-sol', 'regional.openai.gpt-6.1-sol', Decimal('2.2'), Decimal('4.4')),
+        ('openai.gpt-6.1-sol', 'regional.openai.gpt-6.1-sol', Decimal('2.2'), Decimal('4.4')),
+        ('gpt-6.1-sol', 'regional.openai.gpt-6.1-sol', Decimal('2.2'), Decimal('4.4')),
+    ],
+)
+def test_aws_gpt_6_context_boundary(
+    model_ref: str, model_id: str, short_input_rate: Decimal, long_input_rate: Decimal
+) -> None:
+    """AWS bills 272K input tokens or fewer at the short-context rate."""
+    for tokens, rate in ((272_000, short_input_rate), (272_001, long_input_rate)):
+        price = calc_price(
+            Usage(input_tokens=tokens),
+            model_ref=model_ref,
+            provider_id='aws',
+            genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC),
+        )
+
+        assert price.model.id == model_id
+        assert price.input_price == rate * tokens / 1_000_000
+
+
+def test_aws_titan_embed_text_v2_price() -> None:
+    price = calc_price(
+        Usage(input_tokens=1_000_000),
+        model_ref='amazon.titan-embed-text-v2:0',
+        provider_id='aws',
+        genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC),
+    )
+
+    assert price.model.id == 'amazon.titan-embed-text-v2:0'
+    assert price.model.context_window == 8192
+    assert price.input_price == Decimal('0.02')
+    assert price.total_price == Decimal('0.02')
+
+
+@pytest.mark.parametrize(
+    'model_ref,request_timestamp,expected_prices',
+    [
+        (
+            'gemini-3.6-flash',
+            datetime(2026, 12, 31, tzinfo=UTC),
+            ModelPrice(
+                input_mtok=Decimal('0.75'),
+                cache_read_mtok=Decimal('0.075'),
+                output_mtok=Decimal('3.75'),
+                web_searches_kcount=Decimal('14'),
+            ),
+        ),
+        (
+            'gemini-3.6-flash',
+            datetime(2027, 1, 1, tzinfo=UTC),
+            ModelPrice(
+                input_mtok=Decimal('1.5'),
+                cache_read_mtok=Decimal('0.15'),
+                output_mtok=Decimal('7.5'),
+                web_searches_kcount=Decimal('14'),
+            ),
+        ),
+        (
+            'gemini-3.7-flash',
+            datetime(2026, 12, 31, tzinfo=UTC),
+            ModelPrice(
+                input_mtok=Decimal('0.75'),
+                cache_read_mtok=Decimal('0.075'),
+                output_mtok=Decimal('3.75'),
+                web_searches_kcount=Decimal('14'),
+            ),
+        ),
+        (
+            'gemini-3.7-flash',
+            datetime(2027, 1, 1, tzinfo=UTC),
+            ModelPrice(
+                input_mtok=Decimal('1.5'),
+                cache_read_mtok=Decimal('0.15'),
+                output_mtok=Decimal('7.5'),
+                web_searches_kcount=Decimal('14'),
+            ),
+        ),
+        (
+            'gemini-3.8-flash',
+            datetime(2026, 12, 31, tzinfo=UTC),
+            ModelPrice(
+                input_mtok=Decimal('0.75'),
+                cache_read_mtok=Decimal('0.075'),
+                output_mtok=Decimal('3.75'),
+                web_searches_kcount=Decimal('14'),
+            ),
+        ),
+        (
+            'gemini-3.8-flash',
+            datetime(2027, 1, 1, tzinfo=UTC),
+            ModelPrice(
+                input_mtok=Decimal('1.5'),
+                cache_read_mtok=Decimal('0.15'),
+                output_mtok=Decimal('7.5'),
+                web_searches_kcount=Decimal('14'),
+            ),
+        ),
+    ],
+)
+def test_gemini_flash_introductory_price_expiry(
+    model_ref: str, request_timestamp: datetime, expected_prices: ModelPrice
+) -> None:
+    """Introductory rates run through 2026-12-31, standard rates take over on 2027-01-01."""
+    price = calc_price(
+        Usage(input_tokens=0),
+        model_ref=model_ref,
+        provider_id='google',
+        genai_request_timestamp=request_timestamp,
+    )
+
+    assert price.model_price == expected_prices
+
+
+@pytest.mark.parametrize(
+    'request_timestamp,expected_prices,expected_total',
+    [
+        (
+            datetime(2026, 11, 30, 23, 59, tzinfo=UTC),
+            ModelPrice(
+                input_mtok=Decimal('2'),
+                cache_read_mtok=Decimal('0.1'),
+                output_mtok=Decimal('10'),
+                web_searches_kcount=Decimal('14'),
+            ),
+            Decimal('11.81'),
+        ),
+        (
+            datetime(2026, 12, 1, tzinfo=UTC),
+            ModelPrice(
+                input_mtok=Decimal('4'),
+                cache_read_mtok=Decimal('0.2'),
+                output_mtok=Decimal('20'),
+                web_searches_kcount=Decimal('14'),
+            ),
+            Decimal('23.62'),
+        ),
+    ],
+)
+def test_gemini_4_argon_introductory_price_expiry(
+    request_timestamp: datetime, expected_prices: ModelPrice, expected_total: Decimal
+) -> None:
+    """Introductory rates run through 2026-11-30, standard rates take over on 2026-12-01."""
+    price = calc_price(
+        Usage(input_tokens=1_000_000, cache_read_tokens=100_000, output_tokens=1_000_000),
+        model_ref='gemini-4-argon',
+        provider_id='google',
+        genai_request_timestamp=request_timestamp,
+    )
+
+    assert price.model_price == expected_prices
+    assert price.model.context_window == 1_048_576
+    assert price.total_price == expected_total
 
 
 def test_sync_success_with_url():
@@ -211,11 +1118,25 @@ def test_sync_success_with_model_regex():
     assert price.provider.id == snapshot('openai')
 
 
+def test_cloudflare_provider_api_url() -> None:
+    price = calc_price(
+        Usage(input_tokens=1_000_000, output_tokens=1_000_000),
+        model_ref='@cf/openai/gpt-oss-20b',
+        provider_api_url='https://api.cloudflare.com/client/v4/accounts/test-account/ai/v1',
+    )
+
+    assert price.provider.id == 'cloudflare'
+    assert price.input_price == Decimal('0.2')
+    assert price.output_price == Decimal('0.3')
+    assert price.total_price == Decimal('0.5')
+
+
 def test_openrouter_deepseek_v32_price():
     price = calc_price(
         Usage(input_tokens=2_000_000, output_tokens=1_000_000, cache_read_tokens=1_000_000),
         model_ref='deepseek/deepseek-v3.2',
         provider_id='openrouter',
+        genai_request_timestamp=datetime(2026, 10, 17),
     )
 
     assert price.input_price == snapshot(Decimal('0.4576'))
@@ -223,6 +1144,42 @@ def test_openrouter_deepseek_v32_price():
     assert price.total_price == snapshot(Decimal('0.8008'))
     assert price.model.name == snapshot('DeepSeek V3.2')
     assert price.provider.id == snapshot('openrouter')
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'context_window', 'input_rate', 'cache_read_rate', 'output_rate'),
+    [
+        ('deepseek/deepseek-v4-flash', 1_000_000, Decimal('0.14'), Decimal('0.0028'), Decimal('0.28')),
+        ('deepseek/deepseek-v4-pro', 1_000_000, Decimal('1.305'), Decimal('0.10875'), Decimal('2.61')),
+        ('deepseek/deepseek-v4-pro-0813', 1_000_000, Decimal('0.561'), Decimal('0.0187'), Decimal('1.683')),
+        ('deepseek/deepseek-v3.2', 163_000, Decimal('0.23'), Decimal('0.012'), Decimal('0.33')),
+        ('minimax/minimax-m2.5', 196_000, Decimal('0.27'), Decimal('0.15'), Decimal('1.08')),
+        ('z-ai/glm-4.7', 202_000, Decimal('0.388'), Decimal('0.097'), Decimal('1.806')),
+        ('z-ai/glm-5', 205_000, Decimal('0.516'), Decimal('0.129'), Decimal('2.322')),
+        ('z-ai/glm-5.1', 202_000, Decimal('0.743'), Decimal('0.186'), Decimal('2.971')),
+        ('z-ai/glm-5.2', 1_000_000, Decimal('0.495'), Decimal('0.124'), Decimal('1.733')),
+        ('moonshotai/kimi-k2.5', 262_000, Decimal('0.45'), Decimal('0.225'), Decimal('2.2')),
+        ('moonshotai/kimi-k2.6', 262_000, Decimal('0.95'), Decimal('0.16'), Decimal('4')),
+        ('xiaomi/mimo-v2.5', 1_000_000, Decimal('0.2'), Decimal('0.05'), Decimal('0.4')),
+        ('xiaomi/mimo-v2.5-pro', 1_000_000, Decimal('0.36975'), Decimal('0.00306'), Decimal('0.7395')),
+    ],
+)
+def test_avian_prices(
+    model_ref: str, context_window: int, input_rate: Decimal, cache_read_rate: Decimal, output_rate: Decimal
+) -> None:
+    price = calc_price(
+        Usage(input_tokens=2_000_000, cache_read_tokens=1_000_000, output_tokens=1_000_000),
+        model_ref=model_ref,
+        provider_id='avian',
+        genai_request_timestamp=datetime(2026, 10, 18, tzinfo=UTC),
+    )
+
+    assert price.provider.id == 'avian'
+    assert price.model.id == model_ref
+    assert price.model.context_window == context_window
+    assert price.input_price == input_rate + cache_read_rate
+    assert price.output_price == output_rate
+    assert price.total_price == input_rate + cache_read_rate + output_rate
 
 
 @pytest.mark.parametrize(
@@ -237,7 +1194,7 @@ def test_openrouter_deepseek_v32_price():
         ('accounts/fireworks/routers/kimi-k2p6-fast', Decimal('2'), Decimal('0.3'), Decimal('8')),
         ('accounts/fireworks/routers/kimi-k2p7-code-fast', Decimal('1.9'), Decimal('0.38'), Decimal('8')),
         ('accounts/fireworks/routers/kimi-k3-fast', Decimal('4.5'), Decimal('0.45'), Decimal('22.5')),
-        ('accounts/fireworks/routers/kimi-k3-us', Decimal('3.3'), Decimal('0.33'), Decimal('16.5')),
+        ('accounts/fireworks/routers/kimi-k3-us', Decimal('4.5'), Decimal('0.45'), Decimal('22.5')),
         ('accounts/fireworks/models/gpt-oss-120b', Decimal('0.15'), Decimal('0.014'), Decimal('0.6')),
         ('accounts/fireworks/models/gpt-oss-20b', Decimal('0.07'), Decimal('0.035'), Decimal('0.3')),
     ],
@@ -251,6 +1208,7 @@ def test_fireworks_serverless_prices(
     price = calc_price(
         Usage(input_tokens=2_000_000, cache_read_tokens=1_000_000, output_tokens=1_000_000),
         model_ref=model_ref,
+        genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC),
     )
 
     assert price.provider.id == 'fireworks'
@@ -264,6 +1222,7 @@ def test_moonshotai_kimi_k27_code_price():
         Usage(input_tokens=1_000, cache_read_tokens=100, output_tokens=100),
         model_ref='kimi-k2.7-code',
         provider_id='moonshotai',
+        genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC),
     )
 
     assert price.model.id == 'kimi-k2.7-code'
@@ -272,11 +1231,26 @@ def test_moonshotai_kimi_k27_code_price():
     assert price.total_price == Decimal('0.001274')
 
 
+def test_moonshotai_kimi_k27_code_highspeed_price():
+    price = calc_price(
+        Usage(input_tokens=1_000, cache_read_tokens=100, output_tokens=100),
+        model_ref='kimi-k2.7-code-highspeed',
+        provider_id='moonshotai',
+        genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC),
+    )
+
+    assert price.model.id == 'kimi-k2.7-code-highspeed'
+    assert price.input_price == Decimal('0.001748')
+    assert price.output_price == Decimal('0.0008')
+    assert price.total_price == Decimal('0.002548')
+
+
 def test_openrouter_kimi_k27_code_price():
     price = calc_price(
         Usage(input_tokens=1_000, cache_read_tokens=100, output_tokens=100),
         model_ref='moonshotai/kimi-k2.7-code',
         provider_api_url='https://openrouter.ai/api/v1',
+        genai_request_timestamp=datetime(2026, 10, 17),
     )
 
     assert price.model.id == 'moonshotai/kimi-k2.7-code'
@@ -290,6 +1264,7 @@ def test_openrouter_kimi_k27_code_dated_price():
         Usage(input_tokens=2_038_030, output_tokens=13_034),
         model_ref='moonshotai/kimi-k2.7-code-20260612',
         provider_api_url='https://openrouter.ai/api/v1',
+        genai_request_timestamp=datetime(2026, 10, 17),
     )
 
     assert price.model.id == 'moonshotai/kimi-k2.7-code'
@@ -298,11 +1273,66 @@ def test_openrouter_kimi_k27_code_dated_price():
     assert price.total_price == Decimal('1.5741415')
 
 
+def test_modal_kimi_k3_price_by_provider_id() -> None:
+    price = calc_price(
+        Usage(input_tokens=2_000_000, cache_read_tokens=1_000_000, output_tokens=1_000_000),
+        model_ref='moonshotai/Kimi-K3',
+        provider_id='modal',
+    )
+
+    assert_modal_kimi_k3_price(price)
+
+
+def test_modal_kimi_k3_price_by_api_url() -> None:
+    price = calc_price(
+        Usage(input_tokens=2_000_000, cache_read_tokens=1_000_000, output_tokens=1_000_000),
+        model_ref='moonshotai/Kimi-K3',
+        provider_api_url='https://example--kimi-k3.modal.run/v1',
+    )
+
+    assert_modal_kimi_k3_price(price)
+
+
+def test_modal_api_url_does_not_match_spoofed_hostname() -> None:
+    with pytest.raises(
+        LookupError,
+        match="Unable to find provider provider_api_url='https://example.modal.run.evil.test/v1'",
+    ):
+        calc_price(
+            Usage(input_tokens=1),
+            model_ref='moonshotai/Kimi-K3',
+            provider_api_url='https://example.modal.run.evil.test/v1',
+        )
+
+
+def test_modal_inkling_nvfp4_price() -> None:
+    price = calc_price(
+        Usage(input_tokens=2_000_000, cache_read_tokens=1_000_000, output_tokens=1_000_000),
+        model_ref='thinkingmachines/Inkling-NVFP4',
+        provider_id='modal',
+    )
+
+    assert price.provider.id == 'modal'
+    assert price.model.id == 'thinkingmachines/Inkling-NVFP4'
+    assert price.input_price == Decimal('1.47')
+    assert price.output_price == Decimal('5')
+    assert price.total_price == Decimal('6.47')
+
+
+def assert_modal_kimi_k3_price(price: PriceCalculation) -> None:
+    assert price.provider.id == 'modal'
+    assert price.model.id == 'moonshotai/Kimi-K3'
+    assert price.input_price == Decimal('3.3')
+    assert price.output_price == Decimal('15')
+    assert price.total_price == Decimal('18.3')
+
+
 def test_openrouter_glm_51_dated_price():
     price = calc_price(
         Usage(input_tokens=27_447, output_tokens=83),
         model_ref='z-ai/glm-5.1-20260406',
         provider_api_url='https://openrouter.ai/api/v1',
+        genai_request_timestamp=datetime(2026, 10, 17),
     )
 
     assert price.model.id == 'z-ai/glm-5.1'
@@ -316,9 +1346,24 @@ def test_openrouter_glm_52_dated_price():
         Usage(input_tokens=1_000, output_tokens=100),
         model_ref='z-ai/glm-5.2-20260616',
         provider_api_url='https://openrouter.ai/api/v1',
+        genai_request_timestamp=datetime(2026, 10, 17),
     )
 
     assert price.model.id == 'z-ai/glm-5.2'
+    assert price.input_price == Decimal('0.0014')
+    assert price.output_price == Decimal('0.00044')
+    assert price.total_price == Decimal('0.00184')
+
+
+def test_openrouter_glm_53_dated_price():
+    price = calc_price(
+        Usage(input_tokens=1_000, output_tokens=100),
+        model_ref='z-ai/glm-5.3-20260816',
+        provider_api_url='https://openrouter.ai/api/v1',
+        genai_request_timestamp=datetime(2026, 10, 17),
+    )
+
+    assert price.model.id == 'z-ai/glm-5.3'
     assert price.input_price == Decimal('0.0014')
     assert price.output_price == Decimal('0.00044')
     assert price.total_price == Decimal('0.00184')
@@ -349,10 +1394,33 @@ def test_zai_glm_52_price(provider_api_url: str):
         Usage(input_tokens=1_000, cache_read_tokens=600, output_tokens=100),
         model_ref='glm-5.2',
         provider_api_url=provider_api_url,
+        genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC),
     )
 
     assert price.provider.id == 'zai'
     assert price.model.id == 'GLM-5.2'
+    assert price.input_price == Decimal('0.000716')
+    assert price.output_price == Decimal('0.00044')
+    assert price.total_price == Decimal('0.001156')
+
+
+@pytest.mark.parametrize(
+    'provider_api_url',
+    [
+        'https://api.z.ai/api/paas/v4',
+        'https://api.z.ai/api/coding/paas/v4',
+    ],
+)
+def test_zai_glm_53_price(provider_api_url: str):
+    price = calc_price(
+        Usage(input_tokens=1_000, cache_read_tokens=600, output_tokens=100),
+        model_ref='glm-5.3',
+        provider_api_url=provider_api_url,
+        genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC),
+    )
+
+    assert price.provider.id == 'zai'
+    assert price.model.id == 'GLM-5.3'
     assert price.input_price == Decimal('0.000716')
     assert price.output_price == Decimal('0.00044')
     assert price.total_price == Decimal('0.001156')
@@ -367,6 +1435,108 @@ def test_zai_does_not_shadow_zhipuai_model_matching(model_ref: str, model_id: st
 
     assert price.provider.id == 'zhipuai'
     assert price.model.id == model_id
+
+
+def test_bare_glm_53_ref_prices_with_zhipuai():
+    price = calc_price(Usage(input_tokens=1_000, output_tokens=100), model_ref='glm-5.3')
+
+    assert price.provider.id == 'zhipuai'
+    assert price.model.id == 'GLM-5.3'
+    assert price.input_price == Decimal('0.001103')
+    assert price.output_price == Decimal('0.0003862')
+    assert price.total_price == Decimal('0.0014892')
+
+
+def assert_glm_53_flash_price(
+    price: PriceCalculation,
+    *,
+    expected_provider: str,
+    expected_model: str,
+    input_price: Decimal,
+    output_price: Decimal,
+) -> None:
+    assert price.provider.id == expected_provider
+    assert price.model.id == expected_model
+    assert price.input_price == input_price
+    assert price.output_price == output_price
+    assert price.total_price == input_price + output_price
+
+
+def test_zhipuai_glm_53_flash_price():
+    price = calc_price(
+        Usage(input_tokens=1_000, cache_read_tokens=600, output_tokens=100),
+        model_ref='GLM-5.3-Flash',
+        provider_id='zhipuai',
+        genai_request_timestamp=datetime(2026, 9, 9, tzinfo=UTC),
+    )
+
+    assert_glm_53_flash_price(
+        price,
+        expected_provider='zhipuai',
+        expected_model='GLM-5.3-Flash',
+        input_price=Decimal('0.0000316'),
+        output_price=Decimal('0.0000193'),
+    )
+
+
+def test_zai_glm_53_flash_price():
+    price = calc_price(
+        Usage(input_tokens=1_000, cache_read_tokens=600, output_tokens=100),
+        model_ref='glm-5.3-flash',
+        provider_api_url='https://api.z.ai/api/paas/v4',
+        genai_request_timestamp=datetime(2026, 9, 9, tzinfo=UTC),
+    )
+
+    assert_glm_53_flash_price(
+        price,
+        expected_provider='zai',
+        expected_model='GLM-5.3-Flash',
+        input_price=Decimal('0.000039'),
+        output_price=Decimal('0.000025'),
+    )
+
+
+def test_openrouter_glm_53_flash_price():
+    price = calc_price(
+        Usage(input_tokens=1_000, cache_read_tokens=600, output_tokens=100),
+        model_ref='z-ai/glm-5.3-flash',
+        provider_api_url='https://openrouter.ai/api/v1',
+        genai_request_timestamp=datetime(2026, 9, 9, tzinfo=UTC),
+    )
+
+    assert_glm_53_flash_price(
+        price,
+        expected_provider='openrouter',
+        expected_model='z-ai/glm-5.3-flash',
+        input_price=Decimal('0.000039'),
+        output_price=Decimal('0.000025'),
+    )
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'provider_id', 'model_id', 'input_price', 'output_price'),
+    [
+        ('GLM-5.3-Flash', 'zhipuai', 'GLM-5.3-Flash', Decimal('0.0000632'), Decimal('0.0000386')),
+        ('glm-5.3-flash', 'zai', 'GLM-5.3-Flash', Decimal('0.000078'), Decimal('0.00005')),
+        ('z-ai/glm-5.3-flash', 'openrouter', 'z-ai/glm-5.3-flash', Decimal('0.000078'), Decimal('0.00005')),
+    ],
+)
+def test_glm_53_flash_list_price_after_promotion(
+    model_ref: str, provider_id: str, model_id: str, input_price: Decimal, output_price: Decimal
+):
+    """The 50% launch promotion ended on 2026-09-09; list prices apply from 2026-09-10."""
+    price = calc_price(
+        Usage(input_tokens=1_000, cache_read_tokens=600, output_tokens=100),
+        model_ref=model_ref,
+        provider_id=provider_id,
+        genai_request_timestamp=datetime(2026, 9, 10, tzinfo=UTC),
+    )
+
+    assert price.provider.id == provider_id
+    assert price.model.id == model_id
+    assert price.input_price == input_price
+    assert price.output_price == output_price
+    assert price.total_price == input_price + output_price
 
 
 def test_openrouter_modern_dated_aliases_price():
@@ -385,11 +1555,26 @@ def test_openrouter_modern_dated_aliases_price():
             Decimal('0.00016'),
             Decimal('0.00056'),
         ),
+        (
+            'openai/gpt-5.2-20251211',
+            'openai/gpt-5.2',
+            Decimal('0.00175'),
+            Decimal('0.0014'),
+            Decimal('0.00315'),
+        ),
+        (
+            'openai/gpt-5.2-pro-20251211',
+            'openai/gpt-5.2-pro',
+            Decimal('0.021'),
+            Decimal('0.0168'),
+            Decimal('0.0378'),
+        ),
     ]:
         price = calc_price(
             Usage(input_tokens=1_000, output_tokens=100),
             model_ref=model_ref,
             provider_api_url='https://openrouter.ai/api/v1',
+            genai_request_timestamp=datetime(2026, 10, 17),
         )
 
         assert price.model.id == model_id
@@ -398,12 +1583,31 @@ def test_openrouter_modern_dated_aliases_price():
         assert price.total_price == total_price
 
 
+@pytest.mark.parametrize(
+    ('model_ref', 'model_id'),
+    [
+        ('openai/gpt-5.2-20251211', 'gpt-5.2'),
+        ('openai/gpt-5-2-20251211', 'gpt-5.2'),
+        ('openai/gpt-5.2-pro-20251211', 'gpt-5.2-pro'),
+        ('openai/gpt-5-2-pro-20251211', 'gpt-5.2-pro'),
+    ],
+)
+def test_litellm_compact_dated_ref_price(model_ref: str, model_id: str):
+    usage = Usage(input_tokens=1_000, output_tokens=100)
+
+    compact_price = calc_price(usage, model_ref=model_ref, provider_id='litellm')
+    canonical_price = calc_price(usage, model_ref=model_id, provider_id='openai')
+
+    assert compact_price == canonical_price
+
+
 @pytest.mark.parametrize('model_ref', ['deepseek/deepseek-v3.2', 'google/gemini-2.5-flash-lite'])
 def test_openrouter_api_model_refs_priceable_by_api_url(model_ref: str):
     price = calc_price(
         Usage(input_tokens=1_000, output_tokens=100),
         model_ref=model_ref,
         provider_api_url='https://openrouter.ai/api/v1',
+        genai_request_timestamp=datetime(2026, 10, 17),
     )
 
     assert price.model.id == model_ref
@@ -532,7 +1736,9 @@ def test_set_custom_snapshot_does_not_validate_dynamic_model_prices() -> None:
 
 def test_requests_kcount_prices():
     # request count defaults to 1
-    price = calc_price(Usage(), model_ref='sonar', provider_id='perplexity')
+    price = calc_price(
+        Usage(), model_ref='sonar', provider_id='perplexity', genai_request_timestamp=datetime(2026, 10, 17)
+    )
     assert price.input_price == snapshot(Decimal('0'))
     assert price.output_price == snapshot(Decimal('0'))
     assert price.total_price == snapshot(Decimal('0.012'))
@@ -548,14 +1754,129 @@ def test_claude_opus_5_web_search_price():
     assert price.total_price == Decimal('0.02')
 
 
+def test_openai_web_search_price():
+    price = calc_price(
+        Usage(input_tokens=1_000, output_tokens=100, web_searches=5), model_ref='gpt-4.1', provider_id='openai'
+    )
+
+    assert price.input_price == Decimal('0.002')
+    assert price.output_price == Decimal('0.0008')
+    assert price.total_price == Decimal('0.0528')
+
+
+@pytest.mark.parametrize('model_ref', ['o3-deep-research', 'o4-mini-deep-research-2025-06-26'])
+def test_openai_deep_research_tool_prices(model_ref: str):
+    price = calc_price(Usage(web_searches=2, storage_searches=3), model_ref=model_ref, provider_id='openai')
+
+    assert price.input_price == Decimal('0')
+    assert price.output_price == Decimal('0')
+    assert price.total_price == Decimal('0.0275')
+
+
+def test_openai_gpt_56_sol_web_search_price():
+    price = calc_price(
+        Usage(web_searches=3),
+        model_ref='gpt-5.6',
+        provider_id='openai',
+        genai_request_timestamp=datetime(2026, 8, 25, tzinfo=UTC),
+    )
+
+    assert price.total_price == Decimal('0.03')
+
+
+def test_gpt_4o_original_snapshot_price():
+    usage = Usage(input_tokens=1_000, cache_read_tokens=500, output_tokens=100)
+    original = calc_price(usage, model_ref='gpt-4o-2024-05-13', provider_id='openai')
+    later = calc_price(usage, model_ref='gpt-4o-2024-08-06', provider_id='openai')
+
+    assert original.model.id == 'gpt-4o-2024-05-13'
+    assert original.input_price == Decimal('0.005')
+    assert original.output_price == Decimal('0.0015')
+    assert later.model.id == 'gpt-4o'
+    assert later.input_price == Decimal('0.001875')
+    assert later.output_price == Decimal('0.001')
+
+
+def test_devstral_small_price():
+    price = calc_price(
+        Usage(input_tokens=10_000, output_tokens=1_000), model_ref='devstral-small-2507', provider_id='mistral'
+    )
+
+    assert price.model.id == 'devstral-small'
+    assert price.input_price == Decimal('0.001')
+    assert price.output_price == Decimal('0.0003')
+    assert price.total_price == Decimal('0.0013')
+
+    inferred = calc_price(Usage(input_tokens=10_000), model_ref='labs-devstral-small-2512')
+
+    assert inferred.provider.id == 'mistral'
+    assert inferred.model.id == 'devstral-small'
+    assert inferred.input_price == Decimal('0.001')
+
+
+def test_openai_file_search_price():
+    price = calc_price(
+        Usage(input_tokens=1_000, output_tokens=100, storage_searches=4), model_ref='gpt-4.1', provider_id='openai'
+    )
+
+    assert price.input_price == Decimal('0.002')
+    assert price.output_price == Decimal('0.0008')
+    assert price.total_price == Decimal('0.0128')
+
+
+def test_openai_gpt_56_sol_file_search_price():
+    price = calc_price(
+        Usage(storage_searches=2),
+        model_ref='gpt-5.6',
+        provider_id='openai',
+        genai_request_timestamp=datetime(2026, 8, 25, tzinfo=UTC),
+    )
+
+    assert price.total_price == Decimal('0.005')
+
+
 def test_claude_opus_5_one_hour_cache_write_price():
     price = calc_price(
         Usage(input_tokens=1_000_000, cache_write_tokens=1_000_000, cache_write_1h_tokens=1_000_000),
         model_ref='claude-opus-5',
         provider_id='anthropic',
+        genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC),
     )
 
     assert price.input_price == Decimal('10')
+
+
+def test_claude_opus_5_five_minute_cache_write_price():
+    """No shipped model prices `cache_write_5m_mtok`, so a 5m breakdown bills at the generic cache write rate."""
+    price = calc_price(
+        Usage(input_tokens=1_000_000, cache_write_tokens=1_000_000, cache_write_5m_tokens=1_000_000),
+        model_ref='claude-opus-5',
+        provider_id='anthropic',
+        genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC),
+    )
+
+    assert price.input_price == Decimal('6.25')
+
+
+def test_five_minute_cache_write_price_decomposes_alongside_one_hour():
+    price = ModelPrice(
+        input_mtok=Decimal('5'),
+        cache_write_mtok=Decimal('6.25'),
+        cache_write_5m_mtok=Decimal('6.25'),
+        cache_write_1h_mtok=Decimal('10'),
+    ).calc_price(
+        Usage(
+            input_tokens=1_000_000,
+            cache_write_tokens=1_000_000,
+            cache_write_5m_tokens=600_000,
+            cache_write_1h_tokens=400_000,
+        )
+    )
+
+    # 600k at the 5m rate + 400k at the 1h rate, leaving nothing at the generic cache write or base input rates.
+    assert price['input_price'] == Decimal('7.75')
+    assert price['output_price'] == Decimal('0')
+    assert price['total_price'] == Decimal('7.75')
 
 
 def test_distinct_output_category_prices_replace_aggregate_output_rate():
@@ -563,6 +1884,7 @@ def test_distinct_output_category_prices_replace_aggregate_output_rate():
         Usage(output_tokens=100, output_reasoning_tokens=25, output_citation_tokens=10),
         model_ref='sonar-deep-research',
         provider_id='perplexity',
+        genai_request_timestamp=datetime(2026, 10, 17),
     )
 
     # 65 ordinary tokens at $8/MTok + 25 reasoning at $3/MTok + 10 citations at $2/MTok.
@@ -579,12 +1901,6 @@ def test_custom_model_price_can_override_reasoning_rate():
     assert price['total_price'] == Decimal('0.000675')
 
 
-def test_calc_unit_price_matches_mtok_wrapper() -> None:
-    assert calc_unit_price(Decimal('2.5'), 500_000, total_input_tokens=0, per=1_000_000) == calc_mtok_price(
-        Decimal('2.5'), 500_000, total_input_tokens=0
-    )
-
-
 def test_calc_unit_price_handles_absent_price_or_count() -> None:
     assert calc_unit_price(None, 500, total_input_tokens=0, per=1_000) == Decimal(0)
     assert calc_unit_price(Decimal('2.5'), None, total_input_tokens=0, per=1_000) == Decimal(0)
@@ -599,6 +1915,121 @@ def test_calc_unit_price_handles_tiered_prices() -> None:
 
 def test_calc_unit_price_uses_non_million_normalization_factor() -> None:
     assert calc_unit_price(Decimal('12'), 2, total_input_tokens=0, per=1_000) == Decimal('0.024')
+
+
+def test_calc_unit_price_uses_shortest_decimal_fractional_count() -> None:
+    assert calc_unit_price(Decimal('3.6'), 0.1, total_input_tokens=0, per=3_600) == Decimal('0.0001')
+
+
+def test_calc_unit_price_uses_decimal_fractional_count_directly() -> None:
+    assert calc_unit_price(Decimal('3.6'), Decimal('0.1'), total_input_tokens=0, per=3_600) == Decimal('0.0001')
+
+
+def test_model_price_handles_fractional_duration() -> None:
+    price = ModelPrice(audio_hours=Decimal('3.6')).calc_price(Usage(audio_seconds=0.1))
+
+    assert price == {
+        'input_price': Decimal('0'),
+        'output_price': Decimal('0'),
+        'total_price': Decimal('0.0001'),
+    }
+
+
+def test_model_price_handles_decimal_duration() -> None:
+    price = ModelPrice(audio_hours=Decimal('3.6')).calc_price(Usage(audio_seconds=Decimal('0.1')))
+
+    assert price == {
+        'input_price': Decimal('0'),
+        'output_price': Decimal('0'),
+        'total_price': Decimal('0.0001'),
+    }
+
+
+# Rate for the unit under test, and a deliberately different rate for the ancestor prices it must be
+# accompanied by: the unit under test consumes the whole reported count, so ancestors must bill nothing.
+UNIT_UNDER_TEST_RATE = Decimal('3')
+ANCESTOR_RATE = Decimal('7')
+
+REGISTRY_USAGE_KEYS = sorted(_get_registry().units)
+NON_DIRECTIONAL_USAGE_KEYS = sorted(
+    usage_key for usage_key, unit in _get_registry().units.items() if 'direction' not in unit.dimensions
+)
+
+
+def _minimal_priced_units(unit: UnitDef, registry: UnitRegistry) -> list[UnitDef]:
+    """`unit` plus every ancestor price the validator requires alongside it.
+
+    Every join of two of those ancestors is itself an ancestor of `unit`, so ancestors alone satisfy
+    `validate_priced_units`; this test fails if a newly registered unit breaks that.
+    """
+    ancestor_keys = sorted(registry.ancestor_usage_keys(unit.usage_key))
+    return [unit, *(registry.units[ancestor_key] for ancestor_key in ancestor_keys)]
+
+
+def _minimal_model_price(unit: UnitDef, priced_units: list[UnitDef]) -> ModelPrice:
+    return ModelPrice(
+        **{
+            priced_unit.price_key: UNIT_UNDER_TEST_RATE if priced_unit is unit else ANCESTOR_RATE
+            for priced_unit in priced_units
+        }
+    )
+
+
+def _usage_of_one_unit(unit: UnitDef, priced_units: list[UnitDef]) -> Usage:
+    """Report `unit.per` for the unit under test and every ancestor, so all of it decomposes to `unit`."""
+    return Usage(
+        **{priced_unit.usage_key: unit.per for priced_unit in priced_units if priced_unit.usage_key != 'requests'}
+    )
+
+
+def _expected_price(unit: UnitDef) -> Decimal:
+    # `requests` is not a reportable usage key: the engine always prices exactly one request.
+    count = 1 if unit.usage_key == 'requests' else unit.per
+    return UNIT_UNDER_TEST_RATE * count / unit.per
+
+
+@pytest.mark.parametrize('usage_key', REGISTRY_USAGE_KEYS)
+def test_every_registry_unit_prices_end_to_end(usage_key: str) -> None:
+    """Every unit in the registry produces a non-zero price, whether or not any shipped model uses it."""
+    registry = _get_registry()
+    unit = registry.units[usage_key]
+    priced_units = _minimal_priced_units(unit, registry)
+    expected = _expected_price(unit)
+
+    price = _minimal_model_price(unit, priced_units).calc_price(_usage_of_one_unit(unit, priced_units))
+
+    assert price['total_price'] == expected > Decimal(0)
+    direction = unit.dimensions.get('direction')
+    assert price['input_price'] == (expected if direction == 'input' else Decimal(0))
+    assert price['output_price'] == (expected if direction == 'output' else Decimal(0))
+
+
+def test_non_directional_units_inventory() -> None:
+    assert NON_DIRECTIONAL_USAGE_KEYS == [
+        'audio_seconds',
+        'code_executions',
+        'requests',
+        'rerank_searches',
+        'social_searches',
+        'storage_searches',
+        'web_searches',
+    ]
+
+
+@pytest.mark.parametrize('usage_key', NON_DIRECTIONAL_USAGE_KEYS)
+def test_non_directional_units_excluded_from_input_and_output_price(usage_key: str) -> None:
+    """A unit with no `direction` dimension bills into `total_price` only, so input + output < total."""
+    registry = _get_registry()
+    unit = registry.units[usage_key]
+    priced_units = _minimal_priced_units(unit, registry)
+    expected = _expected_price(unit)
+
+    price = _minimal_model_price(unit, priced_units).calc_price(_usage_of_one_unit(unit, priced_units))
+
+    assert price['input_price'] == Decimal(0)
+    assert price['output_price'] == Decimal(0)
+    assert price['total_price'] == expected > Decimal(0)
+    assert price['input_price'] + price['output_price'] != price['total_price']
 
 
 def test_price_constraint_before():
@@ -623,7 +2054,7 @@ def test_price_constraint_time_of_date():
     price = calc_price(
         Usage(input_tokens=100_000_000),
         model_ref='deepseek-chat',
-        genai_request_timestamp=datetime(2025, 6, 1, 16, tzinfo=timezone.utc),
+        genai_request_timestamp=datetime(2025, 6, 1, 16, tzinfo=UTC),
     )
     assert price.input_price == snapshot(Decimal('27.00'))
     assert price.output_price == snapshot(Decimal('0'))
@@ -633,13 +2064,679 @@ def test_price_constraint_time_of_date():
     price = calc_price(
         Usage(input_tokens=100_000_000),
         model_ref='deepseek-chat',
-        genai_request_timestamp=datetime(2025, 6, 1, 17, tzinfo=timezone.utc),
+        genai_request_timestamp=datetime(2025, 6, 1, 17, tzinfo=UTC),
     )
     assert price.input_price == snapshot(Decimal('13.500'))
     assert price.output_price == snapshot(Decimal('0'))
     assert price.total_price == snapshot(Decimal('13.5'))
     assert price.model.name == snapshot('DeepSeek Chat')
     assert price.provider.name == snapshot('Deepseek')
+
+
+@pytest.mark.parametrize(
+    ('genai_request_timestamp', 'expected_input_mtok'),
+    [
+        # 02:00 on the start date at +05:00 is still 2026-08-31 in UTC, so the old price applies.
+        pytest.param(
+            datetime(2026, 9, 1, 2, tzinfo=timezone(timedelta(hours=5))),
+            Decimal('2'),
+            id='start-date-local-day-utc-day-before',
+        ),
+        pytest.param(
+            datetime(2026, 8, 31, 21, tzinfo=UTC),
+            Decimal('2'),
+            id='same-instant-expressed-in-utc',
+        ),
+        # 20:00 the day before the start date at -05:00 is already 2026-09-01 in UTC.
+        pytest.param(
+            datetime(2026, 8, 31, 20, tzinfo=timezone(timedelta(hours=-5))),
+            Decimal('3'),
+            id='start-date-local-day-before-utc-day-of',
+        ),
+        pytest.param(
+            datetime(2026, 9, 1, 1, tzinfo=UTC),
+            Decimal('3'),
+            id='same-instant-expressed-in-utc-after',
+        ),
+        pytest.param(datetime(2026, 8, 31, 23, 59), Decimal('2'), id='naive-before'),
+        pytest.param(datetime(2026, 9, 1), Decimal('3'), id='naive-at-boundary'),
+    ],
+)
+def test_start_date_constraint_compares_the_utc_date(
+    genai_request_timestamp: datetime, expected_input_mtok: Decimal
+) -> None:
+    """The boundary is UTC midnight, not the caller's wall-clock midnight, matching the JS package."""
+    model = ModelInfo(
+        id='start-date-model',
+        match=ClauseEquals('start-date-model'),
+        prices=[
+            ConditionalPrice(prices=ModelPrice(input_mtok=Decimal('2'))),
+            ConditionalPrice(
+                constraint=StartDateConstraint(start_date=date(2026, 9, 1)),
+                prices=ModelPrice(input_mtok=Decimal('3')),
+            ),
+        ],
+    )
+
+    assert model.get_prices(genai_request_timestamp).input_mtok == expected_input_mtok
+
+
+@pytest.mark.parametrize(
+    ('provider_id', 'model_ref', 'expected_input_mtok'),
+    [
+        ('anthropic', 'claude-sonnet-5', Decimal('2')),
+        ('aws', 'global.anthropic.claude-sonnet-5-v1:0', Decimal('2')),
+        ('aws', 'us.anthropic.claude-sonnet-5-v1:0', Decimal('2.2')),
+        ('openrouter', 'anthropic/claude-sonnet-5', Decimal('2')),
+    ],
+)
+def test_claude_sonnet_5_price_does_not_increase(
+    provider_id: str,
+    model_ref: str,
+    expected_input_mtok: Decimal,
+) -> None:
+    price = calc_price(
+        Usage(input_tokens=1_000_000),
+        model_ref=model_ref,
+        provider_id=provider_id,
+        genai_request_timestamp=datetime(2026, 9, 1, tzinfo=UTC),
+    )
+
+    assert price.input_price == expected_input_mtok
+    assert price.total_price == expected_input_mtok
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'request_timestamp', 'expected_output_price'),
+    [
+        ('voxtral-small-2507', datetime(2026, 8, 10, tzinfo=UTC), Decimal('0.3')),
+        ('voxtral-small-latest', datetime(2026, 8, 11, tzinfo=UTC), Decimal('0.4')),
+    ],
+)
+def test_mistral_voxtral_small_price_change(
+    model_ref: str,
+    request_timestamp: datetime,
+    expected_output_price: Decimal,
+) -> None:
+    price = calc_price(
+        Usage(output_tokens=1_000_000),
+        model_ref=model_ref,
+        provider_id='mistral',
+        genai_request_timestamp=request_timestamp,
+    )
+
+    assert price.model.id == 'voxtral-small-24b-2507'
+    assert price.output_price == expected_output_price
+    assert price.total_price == expected_output_price
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'request_timestamp', 'expected_model_id', 'expected_input_price', 'expected_output_price'),
+    [
+        (
+            'ministral-8b-2410',
+            datetime(2026, 8, 24, tzinfo=UTC),
+            'ministral-8b',
+            Decimal('0.1'),
+            Decimal('0.1'),
+        ),
+        (
+            'ministral-8b-2512',
+            datetime(2026, 8, 24, tzinfo=UTC),
+            'ministral-8b-2512',
+            Decimal('0.15'),
+            Decimal('0.15'),
+        ),
+        (
+            'ministral-8b-latest',
+            datetime(2025, 12, 1, tzinfo=UTC),
+            'ministral-8b-latest',
+            Decimal('0.1'),
+            Decimal('0.1'),
+        ),
+        (
+            'ministral-8b-latest',
+            datetime(2025, 12, 2, tzinfo=UTC),
+            'ministral-8b-latest',
+            Decimal('0.15'),
+            Decimal('0.15'),
+        ),
+        (
+            'mistral-medium-2312',
+            datetime(2025, 6, 15, tzinfo=UTC),
+            'mistral-medium-2312',
+            Decimal('2.7'),
+            Decimal('8.1'),
+        ),
+        (
+            'mistral-medium-2505',
+            datetime(2026, 8, 24, tzinfo=UTC),
+            'mistral-medium-3-1',
+            Decimal('0.4'),
+            Decimal('2'),
+        ),
+        (
+            'mistral-medium-2508',
+            datetime(2026, 8, 24, tzinfo=UTC),
+            'mistral-medium-3-1',
+            Decimal('0.4'),
+            Decimal('2'),
+        ),
+        (
+            'mistral-medium-3.5',
+            datetime(2026, 8, 24, tzinfo=UTC),
+            'mistral-medium-3-5',
+            Decimal('1.5'),
+            Decimal('7.5'),
+        ),
+        (
+            'mistral-medium-3-5',
+            datetime(2026, 8, 24, tzinfo=UTC),
+            'mistral-medium-3-5',
+            Decimal('1.5'),
+            Decimal('7.5'),
+        ),
+        (
+            'mistral-medium-3',
+            datetime(2026, 8, 24, tzinfo=UTC),
+            'mistral-medium-3-5',
+            Decimal('1.5'),
+            Decimal('7.5'),
+        ),
+        (
+            'mistral-medium-2604',
+            datetime(2026, 8, 24, tzinfo=UTC),
+            'mistral-medium-3-5',
+            Decimal('1.5'),
+            Decimal('7.5'),
+        ),
+        (
+            'mistral-medium-latest',
+            datetime(2026, 6, 15, tzinfo=UTC),
+            'mistral-medium-latest',
+            Decimal('0.4'),
+            Decimal('2'),
+        ),
+        (
+            'mistral-medium-latest',
+            datetime(2026, 6, 16, tzinfo=UTC),
+            'mistral-medium-latest',
+            Decimal('1.5'),
+            Decimal('7.5'),
+        ),
+        (
+            'open-mixtral-8x22b',
+            datetime(2025, 3, 1, tzinfo=UTC),
+            'mixtral-8x22b-instruct',
+            Decimal('2'),
+            Decimal('6'),
+        ),
+        (
+            'mixtral-8x22b-instruct',
+            datetime(2026, 10, 20, tzinfo=UTC),
+            'mixtral-8x22b-instruct',
+            Decimal('2'),
+            Decimal('6'),
+        ),
+        (
+            'mistral-small-2506',
+            datetime(2026, 7, 1, tzinfo=UTC),
+            'mistral-small-3.2-24b-instruct',
+            Decimal('0.1'),
+            Decimal('0.3'),
+        ),
+        (
+            'mistral-small-3.2-24b-instruct',
+            datetime(2026, 10, 20, tzinfo=UTC),
+            'mistral-small-3.2-24b-instruct',
+            Decimal('0.1'),
+            Decimal('0.3'),
+        ),
+        (
+            'mistral-small-latest',
+            datetime(2026, 3, 15, tzinfo=UTC),
+            'mistral-small-latest',
+            Decimal('0.1'),
+            Decimal('0.3'),
+        ),
+        (
+            'mistral-small-latest',
+            datetime(2026, 3, 16, tzinfo=UTC),
+            'mistral-small-latest',
+            Decimal('0.15'),
+            Decimal('0.6'),
+        ),
+    ],
+)
+def test_mistral_versioned_model_prices(
+    model_ref: str,
+    request_timestamp: datetime,
+    expected_model_id: str,
+    expected_input_price: Decimal,
+    expected_output_price: Decimal,
+) -> None:
+    price = calc_price(
+        Usage(input_tokens=1_000_000, output_tokens=1_000_000),
+        model_ref=model_ref,
+        provider_id='mistral',
+        genai_request_timestamp=request_timestamp,
+    )
+
+    assert price.model.id == expected_model_id
+    assert price.input_price == expected_input_price
+    assert price.output_price == expected_output_price
+    assert price.total_price == expected_input_price + expected_output_price
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'request_timestamp'),
+    [
+        ('mistral-medium-2508', datetime(2026, 8, 24, tzinfo=UTC)),
+        ('mistral-medium-latest', datetime(2026, 6, 15, tzinfo=UTC)),
+    ],
+)
+def test_mistral_medium_3_cached_input_price(model_ref: str, request_timestamp: datetime) -> None:
+    price = calc_price(
+        Usage(input_tokens=1_000_000, cache_read_tokens=1_000_000),
+        model_ref=model_ref,
+        provider_id='mistral',
+        genai_request_timestamp=request_timestamp,
+    )
+
+    assert price.input_price == Decimal('0.04')
+    assert price.total_price == Decimal('0.04')
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'request_timestamp', 'expected_model_id', 'expected_page_price', 'expected_annotated_page_price'),
+    [
+        (
+            'mistral-ocr-2503-completion',
+            datetime(2025, 3, 6, tzinfo=UTC),
+            'mistral-ocr-2503',
+            Decimal('1'),
+            Decimal('1'),
+        ),
+        (
+            'mistral-ocr-2505',
+            datetime(2025, 5, 22, tzinfo=UTC),
+            'mistral-ocr-2505',
+            Decimal('1'),
+            Decimal('3'),
+        ),
+        (
+            'mistral-ocr-2512-completion',
+            datetime(2025, 12, 18, tzinfo=UTC),
+            'mistral-ocr-2512',
+            Decimal('2'),
+            Decimal('3'),
+        ),
+        (
+            'mistral-ocr-4-0',
+            datetime(2026, 6, 23, tzinfo=UTC),
+            'mistral-ocr-4-0',
+            Decimal('4'),
+            Decimal('5'),
+        ),
+        (
+            'mistral-ocr-4',
+            datetime(2026, 7, 16, tzinfo=UTC),
+            'mistral-ocr-4-1',
+            Decimal('4'),
+            Decimal('5'),
+        ),
+        (
+            'mistral-ocr-latest',
+            datetime(2025, 3, 6, tzinfo=UTC),
+            'mistral-ocr-latest',
+            Decimal('1'),
+            Decimal('1'),
+        ),
+        (
+            'mistral-ocr-latest',
+            datetime(2025, 5, 22, tzinfo=UTC),
+            'mistral-ocr-latest',
+            Decimal('1'),
+            Decimal('3'),
+        ),
+        (
+            'mistral-ocr-latest',
+            datetime(2025, 12, 17, tzinfo=UTC),
+            'mistral-ocr-latest',
+            Decimal('1'),
+            Decimal('3'),
+        ),
+        (
+            'mistral-ocr-latest',
+            datetime(2025, 12, 18, tzinfo=UTC),
+            'mistral-ocr-latest',
+            Decimal('2'),
+            Decimal('3'),
+        ),
+        (
+            'mistral-ocr-latest',
+            datetime(2026, 6, 23, tzinfo=UTC),
+            'mistral-ocr-latest',
+            Decimal('4'),
+            Decimal('5'),
+        ),
+    ],
+)
+def test_mistral_ocr_prices(
+    model_ref: str,
+    request_timestamp: datetime,
+    expected_model_id: str,
+    expected_page_price: Decimal,
+    expected_annotated_page_price: Decimal,
+) -> None:
+    page_price = calc_price(
+        Usage(input_document_pages=1_000),
+        model_ref=model_ref,
+        provider_id='mistral',
+        genai_request_timestamp=request_timestamp,
+    )
+    annotated_page_price = calc_price(
+        Usage(input_document_pages=1_000, input_annotated_document_pages=1_000),
+        model_ref=model_ref,
+        provider_id='mistral',
+        genai_request_timestamp=request_timestamp,
+    )
+
+    assert page_price.model.id == expected_model_id
+    assert page_price.input_price == expected_page_price
+    assert page_price.total_price == expected_page_price
+    assert annotated_page_price.input_price == expected_annotated_page_price
+    assert annotated_page_price.total_price == expected_annotated_page_price
+
+
+def test_voxtral_provider_inference() -> None:
+    price = calc_price(Usage(output_tokens=1), model_ref='voxtral-small-latest')
+
+    assert price.provider.id == 'mistral'
+    assert price.model.id == 'voxtral-small-24b-2507'
+
+
+def test_qualified_openrouter_voxtral_model_does_not_infer_mistral() -> None:
+    model_ref = 'mistralai/voxtral-small-24b-2507'
+
+    with pytest.raises(LookupError, match=f"Unable to find provider with model matching '{model_ref}'"):
+        calc_price(Usage(output_tokens=1), model_ref=model_ref)
+
+    price = calc_price(
+        Usage(output_tokens=1),
+        model_ref=model_ref,
+        provider_api_url='https://openrouter.ai/api/v1',
+        genai_request_timestamp=datetime(2026, 10, 17),
+    )
+    assert price.provider.id == 'openrouter'
+    assert price.model.id == model_ref
+
+
+@pytest.mark.parametrize(
+    ('genai_request_timestamp', 'expected_input_price'),
+    [
+        # DeepSeek's off-peak window is 00:30:00Z-16:30:00Z; a naive timestamp is read as UTC.
+        (datetime(2025, 6, 1, 16), Decimal('27.00')),
+        (datetime(2025, 6, 1, 17), Decimal('13.500')),
+    ],
+)
+def test_time_of_date_constraint_reads_naive_timestamp_as_utc(
+    genai_request_timestamp: datetime, expected_input_price: Decimal
+) -> None:
+    price = calc_price(
+        Usage(input_tokens=100_000_000),
+        model_ref='deepseek-chat',
+        genai_request_timestamp=genai_request_timestamp,
+    )
+
+    assert price.input_price == expected_input_price
+
+
+def _midnight_spanning_model() -> ModelInfo:
+    """A model whose off-peak window wraps around midnight; no shipped model has one."""
+    return ModelInfo(
+        id='wrapping-window',
+        match=ClauseEquals('wrapping-window'),
+        prices=[
+            ConditionalPrice(prices=ModelPrice(input_mtok=Decimal('1'))),
+            ConditionalPrice(
+                TimeOfDateConstraint(
+                    start_time=time(22, tzinfo=UTC),
+                    end_time=time(6, tzinfo=UTC),
+                ),
+                prices=ModelPrice(input_mtok=Decimal('0.5')),
+            ),
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    ('genai_request_timestamp', 'expected_input_mtok'),
+    [
+        (datetime(2026, 7, 30, 23, tzinfo=UTC), Decimal('0.5')),
+        (datetime(2026, 7, 30, 3, tzinfo=UTC), Decimal('0.5')),
+        (datetime(2026, 7, 30, 22, tzinfo=UTC), Decimal('0.5')),
+        (datetime(2026, 7, 30, 6, tzinfo=UTC), Decimal('1')),
+        (datetime(2026, 7, 30, 12, tzinfo=UTC), Decimal('1')),
+    ],
+)
+def test_time_of_date_constraint_spanning_midnight(
+    genai_request_timestamp: datetime, expected_input_mtok: Decimal
+) -> None:
+    model = _midnight_spanning_model()
+
+    assert model.get_prices(genai_request_timestamp) == ModelPrice(input_mtok=expected_input_mtok)
+
+
+def test_time_of_date_constraint_spanning_midnight_reads_naive_timestamp_as_utc() -> None:
+    model = _midnight_spanning_model()
+
+    assert model.get_prices(datetime(2026, 7, 30, 23)) == ModelPrice(input_mtok=Decimal('0.5'))
+    assert model.get_prices(datetime(2026, 7, 30, 12)) == ModelPrice(input_mtok=Decimal('1'))
+
+
+def _naive_window_model() -> ModelInfo:
+    return ModelInfo(
+        id='naive-window',
+        match=ClauseEquals('naive-window'),
+        prices=[
+            ConditionalPrice(prices=ModelPrice(input_mtok=Decimal('1'))),
+            ConditionalPrice(
+                TimeOfDateConstraint(start_time=time(0, 30), end_time=time(16, 30)),
+                prices=ModelPrice(input_mtok=Decimal('0.5')),
+            ),
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    'genai_request_timestamp',
+    [
+        datetime(2026, 7, 30, 12),
+        datetime(2026, 7, 30, 12, tzinfo=UTC),
+        # 18:00+02:00 is 16:00Z (inside). Local 18:00 is outside 00:30–16:30, so a wall-clock compare fails.
+        datetime(2026, 7, 30, 18, tzinfo=timezone(timedelta(hours=2))),
+    ],
+)
+def test_time_of_date_constraint_naive_window_is_utc(genai_request_timestamp: datetime) -> None:
+    """A naive constraint window is UTC, same as a naive request timestamp."""
+    model = _naive_window_model()
+
+    assert model.get_prices(genai_request_timestamp) == ModelPrice(input_mtok=Decimal('0.5'))
+    assert model.get_prices(datetime(2026, 7, 30, 17)) == ModelPrice(input_mtok=Decimal('1'))
+
+
+@pytest.mark.parametrize('offset_hours', [-11, -5, 0, 5, 9, 14])
+@pytest.mark.parametrize('hour', range(24))
+def test_time_of_date_constraint_is_offset_independent(offset_hours: int, hour: int) -> None:
+    """The same instant must price the same however the caller's timezone expresses it.
+
+    Comparing an offset-aware `timetz()` directly does not survive an offset that crosses midnight,
+    which silently picked the wrong side of DeepSeek's off-peak window for non-UTC callers.
+    """
+    tz = timezone(timedelta(hours=offset_hours))
+    local = datetime(2026, 1, 15, hour, tzinfo=tz)
+
+    usage = Usage(input_tokens=1_000)
+    local_price = calc_price(usage, model_ref='deepseek-chat', provider_id='deepseek', genai_request_timestamp=local)
+    utc_price = calc_price(
+        usage,
+        model_ref='deepseek-chat',
+        provider_id='deepseek',
+        genai_request_timestamp=local.astimezone(UTC),
+    )
+
+    assert local_price.total_price == utc_price.total_price
+
+
+# An unanchored `api_pattern` must not match a provider host that merely appears inside the URL.
+PROXIED_OPENAI_API_URL = 'http://localhost:8080/proxy?u=https://api.openai.com/v1'
+
+
+def test_provider_api_url_matching_is_anchored():
+    expected_error = re.escape(f"Unable to find provider provider_api_url='{PROXIED_OPENAI_API_URL}'")
+    with pytest.raises(LookupError, match=expected_error):
+        calc_price(Usage(input_tokens=1_000), model_ref='gpt-4o', provider_api_url=PROXIED_OPENAI_API_URL)
+
+
+def test_provider_api_url_matches_at_the_start_of_the_url():
+    price = calc_price(
+        Usage(input_tokens=1_000),
+        model_ref='gpt-4o',
+        provider_api_url='https://api.openai.com/v1/chat/completions',
+    )
+
+    assert price.provider.id == 'openai'
+
+
+@pytest.mark.parametrize(
+    'model_ref,model_name,off_peak,peak',
+    [
+        ('deepseek-v4-flash', 'DeepSeek V4 Flash', Decimal('22.00'), Decimal('30.00')),
+        ('deepseek-v4-pro', 'DeepSeek V4 Pro', Decimal('66.00'), Decimal('132.00')),
+        ('deepseek-flash', 'DeepSeek V4.1 Flash', Decimal('15.00'), Decimal('30.00')),
+    ],
+)
+@pytest.mark.parametrize(
+    'hour,is_peak',
+    [
+        (0, False),
+        (1, True),
+        (4, False),
+        (5, False),
+        (6, True),
+        (9, True),
+        (10, False),
+        (23, False),
+    ],
+)
+def test_price_constraint_two_time_of_date_windows(
+    model_ref: str,
+    model_name: str,
+    off_peak: Decimal,
+    peak: Decimal,
+    hour: int,
+    is_peak: bool,
+):
+    """Deepseek V4 charges peak rates in two disjoint daily windows, so it has two constrained prices."""
+    price = calc_price(
+        Usage(input_tokens=100_000_000),
+        model_ref=model_ref,
+        genai_request_timestamp=datetime(2026, 8, 20, hour, tzinfo=UTC),
+    )
+    assert price.input_price == (peak if is_peak else off_peak)
+    assert price.model.name == model_name
+    assert price.provider.name == 'Deepseek'
+
+
+@pytest.mark.parametrize(
+    'model_ref,historic,peak',
+    [
+        ('deepseek-v4-flash', Decimal('14.00'), Decimal('30.00')),
+        ('deepseek-v4-pro', Decimal('43.50'), Decimal('132.00')),
+    ],
+)
+@pytest.mark.parametrize(
+    'hour,in_peak_window',
+    [
+        (0, False),
+        (2, True),
+        (12, False),
+        (23, False),
+    ],
+)
+def test_price_deepseek_v4_before_repricing(
+    model_ref: str,
+    historic: Decimal,
+    peak: Decimal,
+    hour: int,
+    in_peak_window: bool,
+):
+    """Before 2026-08-17 the V4 models were billed at a single flat rate.
+
+    That rate is the unconstrained first price, so it is preserved for the 17 hours a day that fall
+    outside the two peak windows. `constraint` is a union, so the peak entries cannot also be gated
+    on a start date, and during those windows a pre-repricing request still resolves to the peak
+    rate - see https://github.com/pydantic/genai-prices/issues/582.
+    """
+    price = calc_price(
+        Usage(input_tokens=100_000_000),
+        model_ref=model_ref,
+        genai_request_timestamp=datetime(2026, 5, 1, hour, tzinfo=UTC),
+    )
+    assert price.input_price == (peak if in_peak_window else historic)
+
+
+@pytest.mark.parametrize(
+    'timestamp,off_peak',
+    [
+        (datetime(2026, 9, 9, 23, tzinfo=UTC), Decimal('22.00')),
+        (datetime(2026, 9, 10, 0, tzinfo=UTC), Decimal('15.00')),
+    ],
+)
+def test_price_deepseek_v4_flash_routed_to_v4_1_flash(timestamp: datetime, off_peak: Decimal):
+    """From 2026-09-10 `deepseek-v4-flash` is served by V4.1 Flash and billed at its off-peak rate."""
+    price = calc_price(
+        Usage(input_tokens=100_000_000), model_ref='deepseek-v4-flash', genai_request_timestamp=timestamp
+    )
+    assert price.input_price == off_peak
+
+
+@pytest.mark.parametrize(
+    'model_ref,first_long_token,base_input,long_input',
+    [
+        ('grok-4.5', 200_000, Decimal('2'), Decimal('4')),
+        ('grok-4.7', 200_000, Decimal('2'), Decimal('4')),
+        ('grok-4.3', 200_000, Decimal('1.25'), Decimal('2.5')),
+        ('grok-4.20', 200_000, Decimal('1.25'), Decimal('2.5')),
+        ('grok-build-0.1', 200_000, Decimal('1'), Decimal('2')),
+        ('gpt-5.4', 272_001, Decimal('2.5'), Decimal('5')),
+        ('gpt-5.4-pro', 272_001, Decimal('30'), Decimal('60')),
+        ('gpt-5.5', 272_001, Decimal('5'), Decimal('10')),
+        ('gpt-5.5-pro', 272_001, Decimal('30'), Decimal('60')),
+        ('gpt-5.6-luna', 272_001, Decimal('0.2'), Decimal('0.4')),
+        ('gpt-5.6-sol', 272_001, Decimal('4'), Decimal('8')),
+        ('gpt-5.6-terra', 272_001, Decimal('2'), Decimal('4')),
+        ('gpt-6.1-sol', 272_001, Decimal('2'), Decimal('4')),
+        ('gpt-6.1-terra', 272_001, Decimal('1'), Decimal('2')),
+    ],
+)
+def test_price_long_context_cliff(model_ref: str, first_long_token: int, base_input: Decimal, long_input: Decimal):
+    """xAI and OpenAI bill long-context requests as a cliff, not a marginal tier."""
+    under = calc_price(Usage(input_tokens=first_long_token - 1), model_ref=model_ref)
+    assert under.input_price == (first_long_token - 1) * base_input / 1_000_000
+
+    over = calc_price(Usage(input_tokens=first_long_token), model_ref=model_ref)
+    assert over.input_price == first_long_token * long_input / 1_000_000
+    assert over.input_price > under.input_price * Decimal('1.99')
+
+
+def test_price_long_context_cliff_is_not_marginal():
+    """Pin the cliff against the marginal reading on a request well past the threshold."""
+    price = calc_price(Usage(input_tokens=1_000_000), model_ref='gpt-5.5')
+    assert price.input_price == Decimal('10')
+    marginal = Decimal('272000') * Decimal('5') / 1_000_000 + Decimal('728000') * Decimal('10') / 1_000_000
+    assert price.input_price != marginal
 
 
 def test_provider_not_found_id():
@@ -657,68 +2754,94 @@ def test_provider_not_found_model_ref():
         calc_price(Usage(input_tokens=500_000), model_ref='llama2-70b-4096')
 
 
+@pytest.mark.parametrize(
+    ('model_ref', 'expected_model_id', 'expected_total_price'),
+    [
+        ('pixtral-12b-latest', 'pixtral-12b', Decimal('0.000165')),
+        ('pixtral-large-2411', 'pixtral-large', Decimal('0.0026')),
+        ('mixtral-8x7b-instruct-v0.1', 'mixtral-8x7b', Decimal('0.00077')),
+    ],
+)
+def test_mistral_models_found_without_provider(
+    model_ref: str, expected_model_id: str, expected_total_price: Decimal
+) -> None:
+    price = calc_price(Usage(input_tokens=1000, output_tokens=100), model_ref=model_ref)
+
+    assert price.provider.id == 'mistral'
+    assert price.model.id == expected_model_id
+    assert price.total_price == expected_total_price
+
+
 def test_model_not_found():
     with pytest.raises(LookupError, match="Unable to find model with model_ref='wrong' in google"):
         calc_price(Usage(input_tokens=500_000), model_ref='wrong', provider_id='google')
 
 
-EXAMPLES: list[tuple[str, str]] = [
+EXAMPLES: list[tuple[str, str, Decimal]] = [
     # ('openrouter', 'amazon/us.amazon.nova-micro-v1:0'),
     # ('openrouter', 'amazon/us.amazon.nova-pro-v1:0'),
-    ('anthropic', 'anthropic.claude-v2'),
-    ('anthropic', 'claude-3-5-haiku-123'),
-    ('anthropic', 'claude-3-5-haiku-20241022'),
-    ('anthropic', 'claude-3-5-haiku-latest'),
-    ('anthropic', 'claude-3-5-sonnet-20241022'),
-    ('anthropic', 'claude-3-5-sonnet-latest'),
-    ('anthropic', 'claude-3-7-sonnet-20250219'),
-    ('anthropic', 'claude-3-7-sonnet-latest'),
-    ('anthropic', 'claude-3-opus-20240229'),
-    ('anthropic', 'claude-opus-4-20250514'),
-    ('anthropic', 'claude-opus-4-20250514'),
-    ('anthropic', 'claude-opus-4-0'),
-    ('cohere', 'command-r7b-12-2024'),
-    ('deepseek', 'deepseek-r1-distill-llama-70b'),
-    ('google', 'gemini-1.5-flash-002'),
-    ('google', 'gemini-1.5-flash-123'),
-    ('google', 'gemini-1.5-flash'),
-    ('google', 'gemini-1.5-pro-002'),
-    ('google', 'gemini-2.0-flash-exp'),
-    ('google', 'gemini-2.0-flash-thinking-exp-01-21'),
-    ('google', 'gemini-2.0-flash'),
-    ('google', 'gemini-2.5-pro-preview-03-25'),
+    ('anthropic', 'anthropic.claude-v2', snapshot(Decimal('0.0104'))),
+    ('anthropic', 'claude-3-5-haiku-123', snapshot(Decimal('0.0012'))),
+    ('anthropic', 'claude-3-5-haiku-20241022', snapshot(Decimal('0.0012'))),
+    ('anthropic', 'claude-3-5-haiku-latest', snapshot(Decimal('0.0012'))),
+    ('anthropic', 'claude-3-5-sonnet-20241022', snapshot(Decimal('0.0045'))),
+    ('anthropic', 'claude-3-5-sonnet-latest', snapshot(Decimal('0.0045'))),
+    ('anthropic', 'claude-3-7-sonnet-20250219', snapshot(Decimal('0.0045'))),
+    ('anthropic', 'claude-3-7-sonnet-latest', snapshot(Decimal('0.0045'))),
+    ('anthropic', 'claude-3-opus-20240229', snapshot(Decimal('0.0225'))),
+    ('anthropic', 'claude-opus-4-20250514', snapshot(Decimal('0.0225'))),
+    ('anthropic', 'claude-opus-4-20250514', snapshot(Decimal('0.0225'))),
+    ('anthropic', 'claude-opus-4-0', snapshot(Decimal('0.0225'))),
+    ('cohere', 'command-r7b-12-2024', snapshot(Decimal('0.0000525'))),
+    ('deepseek', 'deepseek-r1-distill-llama-70b', snapshot(Decimal('0.000769'))),
+    ('google', 'gemini-1.5-flash-002', snapshot(Decimal('0.000105'))),
+    ('google', 'gemini-1.5-flash-123', snapshot(Decimal('0.000105'))),
+    ('google', 'gemini-1.5-flash', snapshot(Decimal('0.000105'))),
+    ('google', 'gemini-1.5-pro-002', snapshot(Decimal('0.00175'))),
+    ('google', 'gemini-2.0-flash-exp', snapshot(Decimal('0.00014'))),
+    ('google', 'gemini-2.0-flash-thinking-exp-01-21', snapshot(Decimal('0.00014'))),
+    ('google', 'gemini-2.0-flash', snapshot(Decimal('0.00014'))),
+    ('google', 'gemini-2.5-pro-preview-03-25', snapshot(Decimal('0.00225'))),
     # ('openrouter', 'meta-llama/llama-3.3-70b-versatile'),
     # ('openrouter', 'meta-llama/llama-4-scout-17b-16e-instruct'),
-    ('mistral', 'mistral-small-latest'),
-    ('mistral', 'pixtral-12b-latest'),
-    ('openai', 'gpt-3.5-turbo-0125'),
-    ('openai', 'gpt-3.5-turbo-instruct:20230824-v2'),
-    ('openai', 'gpt-4-0613'),
-    ('openai', 'gpt-4.1-2025-04-14'),
-    ('openai', 'gpt-4.1-mini-2025-04-14'),
-    ('openai', 'gpt-4.1-mini'),
-    ('openai', 'gpt-4.1-nano-2025-04-14'),
-    ('openai', 'gpt-4.5-preview-2025-02-27'),
-    ('openai', 'gpt-4o-2024-08-06'),
-    ('openai', 'gpt-4o-2024-11-20'),
-    ('openai', 'gpt-4o-audio-preview-2024-10-01'),
-    ('openai', 'gpt-4o-audio-preview-2024-12-17'),
-    ('openai', 'gpt-4o-mini-2024-07-18'),
-    ('openai', 'gpt-4o-mini'),
-    ('openai', 'gpt-4o'),
-    ('openai', 'o3-mini-2025-01-31'),
-    ('openai', 'gpt-5.4'),
-    ('openai', 'gpt-5.4-pro'),
-    ('openai', 'gpt-5.6-sol'),
-    ('openai', 'gpt-5.6-terra'),
-    ('openai', 'gpt-5.6-luna'),
-    ('openai', 'text-embedding-3-small'),
+    ('mistral', 'mistral-small-latest', snapshot(Decimal('0.00021'))),
+    ('mistral', 'pixtral-12b-latest', snapshot(Decimal('0.000165'))),
+    ('openai', 'gpt-3.5-turbo-0125', snapshot(Decimal('0.00065'))),
+    ('openai', 'gpt-3.5-turbo-instruct:20230824-v2', snapshot(Decimal('0.0017'))),
+    ('openai', 'gpt-4-0613', snapshot(Decimal('0.036'))),
+    ('openai', 'gpt-4.1-2025-04-14', snapshot(Decimal('0.0028'))),
+    ('openai', 'gpt-4.1-mini-2025-04-14', snapshot(Decimal('0.00056'))),
+    ('openai', 'gpt-4.1-mini', snapshot(Decimal('0.00056'))),
+    ('openai', 'gpt-4.1-nano-2025-04-14', snapshot(Decimal('0.00014'))),
+    ('openai', 'gpt-4.5-preview-2025-02-27', snapshot(Decimal('0.090'))),
+    ('openai', 'gpt-4o-2024-08-06', snapshot(Decimal('0.0035'))),
+    ('openai', 'gpt-4o-2024-11-20', snapshot(Decimal('0.0035'))),
+    ('openai', 'gpt-4o-audio-preview-2024-10-01', snapshot(Decimal('0.0035'))),
+    ('openai', 'gpt-4o-audio-preview-2024-12-17', snapshot(Decimal('0.0035'))),
+    ('openai', 'gpt-4o-mini-2024-07-18', snapshot(Decimal('0.00021'))),
+    ('openai', 'gpt-4o-mini', snapshot(Decimal('0.00021'))),
+    ('openai', 'gpt-4o', snapshot(Decimal('0.0035'))),
+    ('openai', 'o3-mini-2025-01-31', snapshot(Decimal('0.00154'))),
+    ('openai', 'gpt-5.4', snapshot(Decimal('0.0040'))),
+    ('openai', 'gpt-5.4-pro', snapshot(Decimal('0.048'))),
+    ('openai', 'gpt-5.6-sol', snapshot(Decimal('0.008'))),
+    ('openai', 'gpt-5.6-terra', snapshot(Decimal('0.0032'))),
+    ('openai', 'gpt-5.6-luna', snapshot(Decimal('0.00032'))),
+    ('openai', 'text-embedding-3-small', snapshot(Decimal('0.00002'))),
 ]
 
 
-@pytest.mark.parametrize('provider,model', EXAMPLES)
-def test_models_found(provider: str, model: str):
-    calc_price(Usage(input_tokens=1000, output_tokens=100), model_ref=model, provider_id=provider)
+@pytest.mark.parametrize('provider,model,expected_total_price', EXAMPLES)
+def test_models_found(provider: str, model: str, expected_total_price: Decimal):
+    price = calc_price(
+        Usage(input_tokens=1000, output_tokens=100),
+        model_ref=model,
+        provider_id=provider,
+        # Pinned so the snapshots stay stable: some of these models price by time of day or start date.
+        genai_request_timestamp=datetime(2026, 7, 30, 12, tzinfo=UTC),
+    )
+
+    assert price.total_price == expected_total_price
 
 
 def test_all_bundled_models_have_a_priceable_public_ref():
@@ -866,6 +2989,40 @@ def test_complex_usage():
     )
 
 
+@pytest.mark.parametrize(
+    ('model_ref', 'input_mtok', 'output_mtok'),
+    [
+        ('gemini-2.5-flash-lite-preview-tts', Decimal('0.5'), Decimal('10')),
+        ('gemini-2.5-flash-tts', Decimal('0.5'), Decimal('10')),
+        ('gemini-2.5-flash-preview-tts', Decimal('0.5'), Decimal('10')),
+        ('gemini-2.5-pro-tts', Decimal('1'), Decimal('20')),
+        ('gemini-2.5-pro-preview-tts', Decimal('1'), Decimal('20')),
+    ],
+)
+def test_gemini_tts_prices(model_ref: str, input_mtok: Decimal, output_mtok: Decimal) -> None:
+    price = calc_price(
+        Usage(input_tokens=1_000_000, output_tokens=1_000_000, output_audio_tokens=1_000_000),
+        model_ref,
+        provider_id='google',
+    )
+
+    assert price.input_price == input_mtok
+    assert price.output_price == output_mtok
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'expected_model_id'),
+    [
+        ('GEMINI-2.5-FLASH-LITE-PREVIEW-06-17', 'gemini-2.5-flash-lite'),
+        ('GEMINI-2.5-PRO', 'gemini-2.5-pro'),
+    ],
+)
+def test_gemini_tts_matching_preserves_case_insensitive_generic_models(model_ref: str, expected_model_id: str) -> None:
+    price = calc_price(Usage(input_tokens=1), model_ref, provider_id='google')
+
+    assert price.model.id == expected_model_id
+
+
 def test_output_audio_usage():
     mil = 1_000_000
 
@@ -891,3 +3048,252 @@ def test_output_audio_usage():
         == snapshot(Decimal('80020.0'))
         == Decimal('20') * output_text_tokens / mil + Decimal('80') * output_audio_tokens / mil
     )
+
+
+def test_grok_4_6_long_context_cliff():
+    """Grok 4.6 bills the whole request at the long-context rate, not just the tokens past 200k.
+
+    Ref: https://docs.x.ai/docs/models/grok-4.6 - "billed at the higher rate for all tokens in
+    the request". Pinning both sides of the threshold: reading it as a marginal tier would put
+    a 500k-token prompt at $1.40 instead of $2.00.
+    """
+    # The boundary is inclusive on xAI's side (">= 200k prompt tokens") but a tier here
+    # fires on `tokens > start`, so the threshold is pinned from both directions: one
+    # token below stays on the base rate, exactly 200k is already on the higher one.
+    under = calc_price(
+        Usage(input_tokens=199_999), 'grok-4.6', provider_id='x-ai', genai_request_timestamp=datetime(2026, 10, 17)
+    )
+    assert under.input_price == snapshot(Decimal('0.399998'))
+
+    at = calc_price(
+        Usage(input_tokens=200_000), 'grok-4.6', provider_id='x-ai', genai_request_timestamp=datetime(2026, 10, 17)
+    )
+    assert at.input_price == snapshot(Decimal('0.8'))
+
+    # One more token roughly doubles the bill; under marginal pricing it would barely move.
+    assert at.input_price > under.input_price * 2 - Decimal('0.0001')
+
+    full = calc_price(
+        Usage(input_tokens=500_000), 'grok-4.6', provider_id='x-ai', genai_request_timestamp=datetime(2026, 10, 17)
+    )
+    assert full.input_price == snapshot(Decimal('2.0'))
+    assert full.input_price != Decimal('200000') * 2 / 1_000_000 + Decimal('300000') * 4 / 1_000_000
+
+    mixed = calc_price(
+        Usage(input_tokens=300_000, cache_read_tokens=10_000, output_tokens=1_000),
+        'grok-4.6',
+        provider_id='x-ai',
+        genai_request_timestamp=datetime(2026, 10, 17),
+    )
+    assert mixed.total_price == snapshot(Decimal('1.182'))
+
+
+def test_gemma_4_31b_prices():
+    usage = Usage(input_tokens=1_000_000, cache_read_tokens=500_000, output_tokens=1_000_000)
+
+    # Gemini API is free; Vertex AI has no per-token price for the self-deployed 31B.
+    google = calc_price(usage, model_ref='gemma-4-31b-it', provider_id='google')
+    assert google.model.id == snapshot('gemma-4-31b-it')
+    assert google.total_price == snapshot(Decimal('0'))
+
+    # The Gemini API ID for the 26B is free too; only the Vertex MaaS ID is paid.
+    gemini_26b = calc_price(usage, model_ref='gemma-4-26b-a4b-it', provider_id='google')
+    assert gemini_26b.model.id == snapshot('gemma-4-26b-a4b-it')
+    assert gemini_26b.total_price == snapshot(Decimal('0'))
+
+    vertex_26b = calc_price(usage, model_ref='gemma-4-26b-a4b-it-maas', provider_id='google')
+    assert vertex_26b.model.id == snapshot('gemma-4-26b-a4b-it-maas')
+    assert vertex_26b.input_price == snapshot(Decimal('0.0825'))
+    assert vertex_26b.output_price == snapshot(Decimal('0.6'))
+    assert vertex_26b.total_price == snapshot(Decimal('0.6825'))
+
+    # OpenRouter's cheapest endpoint moved on 2026-08-27; requests before that keep the old rate.
+    before = calc_price(
+        usage,
+        model_ref='google/gemma-4-31b-it',
+        provider_id='openrouter',
+        genai_request_timestamp=datetime(2026, 8, 26, tzinfo=UTC),
+    )
+    assert before.model.id == snapshot('google/gemma-4-31b-it')
+    assert before.input_price == snapshot(Decimal('0.105'))
+    assert before.output_price == snapshot(Decimal('0.36'))
+    assert before.total_price == snapshot(Decimal('0.465'))
+
+    after = calc_price(
+        usage,
+        model_ref='google/gemma-4-31b-it',
+        provider_id='openrouter',
+        genai_request_timestamp=datetime(2026, 8, 27, tzinfo=UTC),
+    )
+    assert after.input_price == snapshot(Decimal('0.070'))
+    assert after.output_price == snapshot(Decimal('0.34'))
+    assert after.total_price == snapshot(Decimal('0.410'))
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'expected_model_id'),
+    [
+        ('openai/gpt-4.1-mini-2025-04-14', 'openai/gpt-4.1-mini'),
+        ('openai/gpt-5-2025-08-07', 'openai/gpt-5'),
+        ('openai/gpt-5-mini-2025-08-07', 'openai/gpt-5-mini'),
+        ('openai/gpt-5.1-codex-mini-20251113', 'openai/gpt-5.1-codex-mini'),
+        ('openai/gpt-5.3-codex-20260224', 'openai/gpt-5.3-codex'),
+        ('openai/gpt-5.4-20260305', 'openai/gpt-5.4'),
+        ('openai/gpt-5.6-sol-20260901', 'openai/gpt-5.6-sol'),
+        ('openai/gpt-6-sol-20260922', 'openai/gpt-6-sol'),
+        ('openai/gpt-6-luna-20260922', 'openai/gpt-6-luna'),
+    ],
+)
+def test_openrouter_openai_dated_ids(model_ref: str, expected_model_id: str):
+    """OpenRouter resolves OpenAI's date-suffixed ids (both `YYYY-MM-DD` and `YYYYMMDD` forms)."""
+    price = calc_price(
+        Usage(input_tokens=1),
+        model_ref=model_ref,
+        provider_id='openrouter',
+        genai_request_timestamp=datetime(2026, 10, 17),
+    )
+
+    assert price.model.id == expected_model_id
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'openai_model'),
+    [
+        ('openai/gpt-6-sol', 'gpt-6-sol'),
+        ('openai/gpt-6-sol-pro', 'gpt-6-sol'),
+        ('openai/gpt-6-sol-20260922', 'gpt-6-sol'),
+        ('openai/gpt-6.1-sol', 'gpt-6.1-sol'),
+        ('openai/gpt-6.1-sol-pro', 'gpt-6.1-sol'),
+        ('openai/gpt-6.1-sol-pro-20260929', 'gpt-6.1-sol'),
+        ('openai/gpt-6-luna', 'gpt-6-luna'),
+        ('openai/gpt-6-luna-pro', 'gpt-6-luna'),
+        ('openai/gpt-6-luna-20260922', 'gpt-6-luna'),
+    ],
+)
+def test_openrouter_gpt_6_sol_luna_prices(model_ref: str, openai_model: str):
+    for input_tokens in (200_000, 272_000, 272_001, 300_000):
+        usage = Usage(
+            input_tokens=input_tokens,
+            cache_read_tokens=1_000,
+            cache_write_tokens=1_000,
+            output_tokens=1_000,
+            web_searches=1,
+        )
+        price = calc_price(
+            usage, model_ref=model_ref, provider_id='openrouter', genai_request_timestamp=datetime(2026, 10, 17)
+        )
+        direct_price = calc_price(usage, model_ref=openai_model, provider_id='openai')
+
+        assert price.model.id == f'openai/{openai_model}'
+        assert price.model.context_window == 1_050_000
+        assert price.total_price == direct_price.total_price
+
+
+@pytest.mark.parametrize(
+    ('model_ref', 'base_model', 'batch_model'),
+    [
+        ('openai/gpt-6-sol:batch', 'openai/gpt-6-sol', 'openai/gpt-6-sol:batch'),
+        ('openai/gpt-6-sol-pro:batch', 'openai/gpt-6-sol', 'openai/gpt-6-sol:batch'),
+        ('openai/gpt-6.1-sol:batch', 'openai/gpt-6.1-sol', 'openai/gpt-6.1-sol:batch'),
+        ('openai/gpt-6.1-sol-pro:batch', 'openai/gpt-6.1-sol', 'openai/gpt-6.1-sol:batch'),
+        ('openai/gpt-6-luna:batch', 'openai/gpt-6-luna', 'openai/gpt-6-luna:batch'),
+        ('openai/gpt-6-luna-pro:batch', 'openai/gpt-6-luna', 'openai/gpt-6-luna:batch'),
+    ],
+)
+def test_openrouter_gpt_6_sol_luna_batch_prices(model_ref: str, base_model: str, batch_model: str):
+    for input_tokens in (200_000, 272_000, 272_001, 300_000):
+        usage = Usage(
+            input_tokens=input_tokens,
+            cache_read_tokens=1_000,
+            cache_write_tokens=1_000,
+            output_tokens=1_000,
+            web_searches=1,
+        )
+        price = calc_price(
+            usage, model_ref=model_ref, provider_id='openrouter', genai_request_timestamp=datetime(2026, 10, 17)
+        )
+        standard = calc_price(
+            usage, model_ref=base_model, provider_id='openrouter', genai_request_timestamp=datetime(2026, 10, 17)
+        )
+
+        assert price.model.id == batch_model
+        assert price.model.context_window == 1_050_000
+        assert price.total_price == (standard.total_price - Decimal('0.01')) / 2 + Decimal('0.01')
+
+
+@pytest.mark.parametrize(
+    ('input_tokens', 'expected_input_price', 'expected_output_price'),
+    [
+        # at the boundary the whole request is still billed at the base rate
+        (272_000, Decimal('0.68'), Decimal('0.015')),
+        # one token over and the whole request moves to the long-context tier (2x input, 1.5x output)
+        (272_001, Decimal('1.360005'), Decimal('0.0225')),
+    ],
+)
+def test_openrouter_gpt_54_long_context_tier(
+    input_tokens: int, expected_input_price: Decimal, expected_output_price: Decimal
+):
+    price = calc_price(
+        Usage(input_tokens=input_tokens, output_tokens=1_000),
+        model_ref='openai/gpt-5.4',
+        provider_id='openrouter',
+        genai_request_timestamp=datetime(2026, 10, 17),
+    )
+
+    assert price.input_price == expected_input_price
+    assert price.output_price == expected_output_price
+
+
+def test_openrouter_gpt_56_sol_cache_write_price():
+    price = calc_price(
+        Usage(input_tokens=10_000, cache_write_tokens=8_000, cache_read_tokens=1_000, output_tokens=1_000),
+        model_ref='openai/gpt-5.6-sol',
+        provider_id='openrouter',
+        genai_request_timestamp=datetime(2026, 10, 17),
+    )
+
+    # 1,000 uncached @ $2 + 8,000 cache writes @ $2.5 + 1,000 cache reads @ $0.2 (per Mtok)
+    assert price.input_price == Decimal('0.0222')
+    assert price.output_price == Decimal('0.01')
+    assert price.total_price == Decimal('0.0322')
+
+
+@pytest.mark.parametrize(
+    ('provider_id', 'model_ref', 'model_id', 'input_tokens', 'total'),
+    [
+        ('cloudflare', '@cf/cloudflare/clef', '@cf/cloudflare/clef', 1_000_000, Decimal('0.24')),
+        ('cloudflare', 'clef', '@cf/cloudflare/clef', 1_000_000, Decimal('0.24')),
+        ('cloudflare', '@cf/cloudflare/clef-flash', '@cf/cloudflare/clef-flash', 1_000_000, Decimal('0.09')),
+        ('cloudflare', 'clef-flash', '@cf/cloudflare/clef-flash', 1_000_000, Decimal('0.09')),
+        ('together', 'together/Tev1-4B-experimental', 'together/Tev1-4B-experimental', 1_000_000, Decimal('0.04')),
+        ('perplexity', 'pplx-decider-v1-27b', 'pplx-decider-v1-27b', 600, Decimal('0.000012')),
+        ('perplexity', 'pplx-decider-v1.1-27b', 'pplx-decider-v1.1-27b', 367, Decimal('0.00000734')),
+        ('openrouter', 'cloudflare/clef', 'cloudflare/clef', 1_000_000, Decimal('0.24')),
+        ('openrouter', 'cloudflare/clef-flash', 'cloudflare/clef-flash', 1_000_000, Decimal('0.09')),
+        ('openrouter', 'perplexity/pplx-decider-v1-27b', 'perplexity/pplx-decider-v1-27b', 1_000_000, Decimal('0.04')),
+        (
+            'openrouter',
+            'perplexity/pplx-decider-v1.1-27b',
+            'perplexity/pplx-decider-v1.1-27b',
+            1_000_000,
+            Decimal('0.02'),
+        ),
+        ('openrouter', 'typesafe/jev-1.13', 'typesafe/jev-1.13', 476, Decimal('0.000019992')),
+        ('openrouter', 'typesafe/jev-1.13-20260917', 'typesafe/jev-1.13', 476, Decimal('0.000019992')),
+        ('openrouter', '~typesafe/jev-latest', 'typesafe/jev-1.13', 476, Decimal('0.000019992')),
+    ],
+)
+def test_decision_model_input_only_prices(
+    provider_id: str, model_ref: str, model_id: str, input_tokens: int, total: Decimal
+) -> None:
+    price = calc_price(
+        Usage(input_tokens=input_tokens, output_tokens=70),
+        model_ref=model_ref,
+        provider_id=provider_id,
+        genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC),
+    )
+
+    assert price.provider.id == provider_id
+    assert price.model.id == model_id
+    assert price.output_price == 0
+    assert price.total_price == total

@@ -36,6 +36,9 @@ not a reason to skip the others.
 
 ## 1. Branch
 
+In a GitHub agentic workflow, keep its supplied checkout and follow the workflow's publication procedure.
+The trusted safe-output handler creates the PR. Do not run this skill's fetch, push, or `gh pr create` commands there.
+
 Contribute via a branch on `origin` (this repo is `pydantic/genai-prices`, no fork). Always base off
 freshly-fetched upstream:
 
@@ -62,7 +65,12 @@ Providers ship dated snapshot IDs (e.g. `grok-4.5-20260708`) that aren't in thei
 request returns the resolved dated ID in the response `model` field — capture it so the YAML `match`
 covers future dated snapshots.
 
-Key lives in `~/ai-coding-tools/.env` as `OPENROUTER_API_KEY`. Don't reference secret env vars in an
+In a GitHub agentic workflow, use only a probe tool or credential explicitly supplied by the workflow.
+Never read a developer's home-directory credentials from the agent. If no probe is available, verify published IDs
+from official catalogs, leave undocumented snapshot aliases unchanged, and record the missing snapshot verification.
+Do not defer verified provider prices because an undocumented alias could not be probed.
+
+For a local session, the key lives in `~/ai-coding-tools/.env` as `OPENROUTER_API_KEY`. Don't reference secret env vars in an
 inline command (a hook blocks it and `env-run` rejects it) — put the request in a script that consumes
 the var internally, then run it with `env-run`:
 
@@ -74,7 +82,7 @@ the var internally, then run it with `env-run`:
 ```bash
 curl -sS https://openrouter.ai/api/v1/chat/completions \
   -H "Authorization: Bearer ${OPENROUTER_API_KEY}" -H "Content-Type: application/json" \
-  -d '{"model":"<provider>/<model>","messages":[{"role":"user","content":"hi"}],"max_tokens":5}' \
+  -d '{"model":"<provider>/<model>","messages":[{"role":"user","content":"hi"}]}' \
   | jq '{id, model, provider}'
 ```
 
@@ -116,6 +124,11 @@ to — check the provider docs and, if you can, hit the API and read the respons
 match that. Don't assume; the aliasing scheme is provider-specific (some vendors have no bare-family
 alias at all).
 
+Google keeps one family alias per tier: `gemini-flash-latest`, `gemini-flash-lite-latest` and
+`gemini-pro-latest`. Each can point at a different generation, and Google's changelog does not record
+every move. Read the target from the `modelVersion` field of a Gemini API `generateContent` response
+(`GOOGLE_API_KEY` in `~/ai-coding-tools/.env`) before you move one.
+
 ## 4b. Changing the price of a model that already exists
 
 A provider changing its rates is **not** an edit to the existing `prices:` block. Overwriting those
@@ -138,13 +151,18 @@ prices:
       output_mtok: 1.2
 ```
 
-- Put the entry with no `constraint` **first**. Both engines scan the list backwards and take the
-  first entry whose constraint is active, so an unconstrained entry placed last would always win.
+- Put the entry with no `constraint` **first**. All three engines (Python, JS, Go) scan the list backwards and
+  take the first entry whose constraint is active, so an unconstrained entry placed last would always win.
 - Set `start_date` to the date the provider's new price took effect, not to today. Cite the changelog
   or announcement that states that date, in a YAML comment beside `start_date`.
 - Set `prices_checked` to today. It records when you verified the rates, which is a different fact
   from when the rates changed.
 - Append one entry to a model that already uses a list. Leave the existing entries alone.
+- Check every `price_variants` rate card separately. Its listed rates are absolute; omitted keys
+  inherit standard prices for that date. Preserve existing variants
+  and prepend dated entries for changed tier rates, since the first matching value wins per price
+  key. Cite a source for tiers whose rates stayed unchanged. Test each affected context on both sides
+  of the date boundary in Python, JavaScript and Go.
 
 Overwrite in place in exactly one case: the old value was wrong when it was written. A correction has
 no history worth preserving. State which of the two cases you are in, in the PR body.
@@ -169,8 +187,9 @@ history, which is why #531 went green.
 
 ## 5. Build + verify resolution
 
-Use `make build`, not just `make build-prices`. The installed `genai_prices` package (and the JS
-package) read their **bundled** data (`packages/python/genai_prices/data.py`, `packages/js/src/data.ts`).
+Use `make build`, not just `make build-prices`. The installed `genai_prices` package (and the JS and Go
+packages) read their **bundled** data (`packages/python/genai_prices/data.py`, `packages/js/src/data.ts`,
+`packages/go/internal/data/prices.json`).
 `make build-prices` writes only `prices/new_data/v2/*` and `prices/providers/.schema.json` — it does not
 touch the bundled data, so a `calc_price` check run after it verifies **stale** package data and can
 silently show the wrong result. `make build` runs `build-prices` + `package-data` + `inject-providers`.
@@ -195,7 +214,10 @@ for m in ['<id>', '<id>-<YYYYMMDD>', '<provider>/<id>-<YYYYMMDD>', '<provider>-l
 
 ## 6. Commit, push, PR
 
-The pre-commit `build` hook regenerates ten paths, so the first `git commit` will abort after it
+In a GitHub agentic workflow, follow its commit and safe-output procedure instead of the local commands below.
+Include this skill's price evidence, provider coverage, alias verification, and rollout findings in the PR body.
+
+The pre-commit `build` hook regenerates twelve paths, so the first `git commit` will abort after it
 rewrites them; re-stage and commit again. Stage files explicitly — **never `git add -A`** (it leaks
 local/scratch files) — and never `--no-verify`, since that hook is what keeps the published data in
 sync with the YAML:
@@ -207,6 +229,7 @@ git add prices/providers/<provider>.yml \
         prices/new_data/v2/data_slim.json prices/new_data/v2/data_slim.schema.json \
         packages/python/genai_prices/data.py packages/python/genai_prices/data_units.py \
         packages/js/src/data.ts packages/js/src/dataUnits.ts \
+        packages/go/internal/data/prices.json packages/go/data_units.go \
         README.md
 git commit -m "Add <Provider> <Model> pricing"   # re-run once if hooks rewrite files
 git push -u origin <slug>

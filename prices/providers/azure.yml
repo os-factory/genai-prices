@@ -3,7 +3,7 @@ name: Microsoft Azure
 id: azure
 pricing_urls:
   - https://azure.microsoft.com/en-us/pricing/details/cognitive-services/openai-service/#pricing
-api_pattern: (https?://)?([^.]*\.)?(?:openai\.azure\.com|azure-api\.net|cognitiveservices\.azure\.com)
+api_pattern: '(https?://)?([^.]*\.)?(?:openai\.azure\.com|azure-api\.net|cognitiveservices\.azure\.com|services\.ai\.azure\.com)'
 price_comments: >-
   These are prices for "*-Global" models, prices for "Regional" models are often slightly higher.
   Retired models are listed at https://learn.microsoft.com/th-th/azure/ai-foundry/openai/concepts/legacy-models
@@ -16,6 +16,9 @@ extractors:
         dest: input_tokens
       - path: [prompt_tokens_details, cached_tokens]
         dest: cache_read_tokens
+        required: false
+      - path: [prompt_tokens_details, cache_write_tokens]
+        dest: cache_write_tokens
         required: false
       - path: [prompt_tokens_details, audio_tokens]
         dest: input_audio_tokens
@@ -37,11 +40,51 @@ extractors:
       - path: [input_tokens_details, cached_tokens]
         dest: cache_read_tokens
         required: false
+      - path: [input_tokens_details, cache_write_tokens]
+        dest: cache_write_tokens
+        required: false
       - path: [output_tokens_details, reasoning_tokens]
         dest: output_reasoning_tokens
         required: false
       - path: output_tokens
         dest: output_tokens
+  # https://learn.microsoft.com/en-us/azure/ai-foundry/openai/how-to/realtime-audio-websockets
+  - api_flavor: realtime
+    root: [response, usage]
+    mappings:
+      - path: input_tokens
+        dest: input_tokens
+        required: false
+      - path: [input_token_details, text_tokens]
+        dest: input_text_tokens
+        required: false
+      - path: [input_token_details, audio_tokens]
+        dest: input_audio_tokens
+        required: false
+      - path: [input_token_details, image_tokens]
+        dest: input_image_tokens
+        required: false
+      - path: [input_token_details, cached_tokens]
+        dest: cache_read_tokens
+        required: false
+      - path: [input_token_details, cached_tokens_details, text_tokens]
+        dest: cache_text_read_tokens
+        required: false
+      - path: [input_token_details, cached_tokens_details, audio_tokens]
+        dest: cache_audio_read_tokens
+        required: false
+      - path: [input_token_details, cached_tokens_details, image_tokens]
+        dest: cache_image_read_tokens
+        required: false
+      - path: [output_token_details, text_tokens]
+        dest: output_text_tokens
+        required: false
+      - path: [output_token_details, audio_tokens]
+        dest: output_audio_tokens
+        required: false
+      - path: output_tokens
+        dest: output_tokens
+        required: false
   # https://github.com/openai/openai-python/blob/v2.3.0/src/openai/types/create_embedding_response.py
   - api_flavor: embeddings
     root: usage
@@ -63,15 +106,27 @@ extractors:
       - path: cache_creation_input_tokens
         dest: cache_write_tokens
         required: false
+      - path: [cache_creation, ephemeral_5m_input_tokens]
+        dest: cache_write_5m_tokens
+        required: false
+      - path: [cache_creation, ephemeral_1h_input_tokens]
+        dest: cache_write_1h_tokens
+        required: false
       - path: cache_read_input_tokens
         dest: cache_read_tokens
         required: false
       - path: output_tokens
         dest: output_tokens
 
+# Azure AI Foundry also serves third-party "marketplace" models (DeepSeek, xAI Grok, Moonshot Kimi, ...)
+# from the same endpoints. Azure does not publish machine-readable prices for them, so a model that is
+# not listed above is priced through the origin provider - see #455.
 fallback_model_providers:
   - openai
   - anthropic
+  - deepseek
+  - x-ai
+  - moonshotai
 
 models:
   - id: ada
@@ -81,7 +136,7 @@ models:
         - equals: text-embedding-ada
         - equals: text-embedding-ada-002
         - equals: text-embedding-ada-002-v2
-    prices_checked: 2025-07-13
+    prices_checked: 2026-10-19
     prices:
       input_mtok: 0.1
 
@@ -125,13 +180,42 @@ models:
       coding, and problem-solving capabilities, while unblocking a wide range of prompts previously restricted in R1.
     match:
       equals: mai-ds-r1:free
+    context_window: 163840
     prices: {}
 
+  # Azure documents the same limits as OpenAI for these o-series models.
+  # Keep o1 and o1-preview separate: the table lists 200,000 vs 128,000 input token limits.
+  # https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/models-sold-directly-by-azure?pivots=azure-openai
   - id: o1
+    canonical_model: openai/o1
     match:
       or:
         - equals: o1
         - equals: o1-2024-12-17
+    prices_checked: 2026-10-19
+    prices:
+      input_mtok: 15
+      cache_read_mtok: 7.5
+      output_mtok: 60
+
+  - id: o1-mini
+    canonical_model: openai/o1-mini
+    match:
+      or:
+        - equals: o1-mini
+        - equals: o1-mini-2024-09-12
+    prices_checked: 2026-10-19
+    prices:
+      input_mtok: 1.1
+      cache_read_mtok: 0.55
+      output_mtok: 4.4
+
+  - id: o1-preview
+    canonical_model: openai/o1-preview
+    # Prevent `collapse-models` from merging this into o1: its ID has the o1 prefix and its prices match.
+    collapse: false
+    match:
+      or:
         - equals: o1-preview
         - equals: o1-preview-2024-09-12
     prices_checked: 2025-07-03
@@ -140,48 +224,40 @@ models:
       cache_read_mtok: 7.5
       output_mtok: 60
 
-  - id: o1-mini
-    match:
-      or:
-        - equals: o1-mini
-        - equals: o1-mini-2024-09-12
-    prices_checked: 2025-07-03
-    prices:
-      input_mtok: 1.1
-      cache_read_mtok: 0.55
-      output_mtok: 4.4
-
   - id: o3-2025-04-16
+    canonical_model: openai/o3
     match:
       or:
         - equals: o3
         - equals: o3-2025-04-16
-    prices_checked: 2025-07-05
+    prices_checked: 2026-10-19
     prices:
       input_mtok: 2
       cache_read_mtok: 0.5
       output_mtok: 8
 
   - id: o3-mini
+    canonical_model: openai/o3-mini
     match:
       or:
         - equals: o3-mini
         - equals: o3-mini-2025-01-31
-    prices_checked: 2025-07-03
+    prices_checked: 2026-10-19
     prices:
       input_mtok: 1.1
       cache_read_mtok: 0.55
       output_mtok: 4.4
 
   - id: o4-mini
+    canonical_model: openai/o4-mini
     match:
       or:
         - contains: o4-mini
         - contains: o4-mini-2025-04-16
-    prices_checked: 2025-07-05
+    prices_checked: 2026-10-19
     prices:
       input_mtok: 1.1
-      cache_read_mtok: 0.28
+      cache_read_mtok: 0.275
       output_mtok: 4.4
 
   - id: phi-3-medium-128k-instruct
@@ -192,9 +268,11 @@ models:
       adjustments, it excels in tasks involving common sense, mathematics, logical reasoning, and code processing.
     match:
       equals: phi-3-medium-128k-instruct
+    context_window: 131072
     prices:
-      input_mtok: 1
-      output_mtok: 1
+      input_mtok: 0.17
+      output_mtok: 0.68
+    prices_checked: 2026-10-19
 
   - id: phi-3-mini-128k-instruct
     name: Phi-3 Mini 128K Instruct
@@ -204,9 +282,11 @@ models:
       it excels in tasks involving common sense, mathematics, logical reasoning, and code processing.
     match:
       equals: phi-3-mini-128k-instruct
+    context_window: 131072
     prices:
-      input_mtok: 0.1
-      output_mtok: 0.1
+      input_mtok: 0.13
+      output_mtok: 0.52
+    prices_checked: 2026-10-19
 
   - id: phi-3.5-mini-128k-instruct
     name: Phi-3.5 Mini 128K Instruct
@@ -217,9 +297,11 @@ models:
       transformer model using the same tokenizer as Phi-3 Mini.
     match:
       equals: phi-3.5-mini-128k-instruct
+    context_window: 131072
     prices:
-      input_mtok: 0.1
-      output_mtok: 0.1
+      input_mtok: 0.13
+      output_mtok: 0.52
+    prices_checked: 2026-10-19
 
   - id: phi-4
     name: Phi 4
@@ -228,9 +310,11 @@ models:
       with limited memory or where quick responses are needed.
     match:
       equals: phi-4
+    context_window: 16384
     prices:
-      input_mtok: 0.07
-      output_mtok: 0.14
+      input_mtok: 0.125
+      output_mtok: 0.5
+    prices_checked: 2026-10-19
 
   - id: phi-4-mini-instruct
     name: Phi 4 Mini Instruct
@@ -239,11 +323,11 @@ models:
       with a focus on high-quality, reasoning-dense data.
     match:
       equals: phi-4-mini-instruct
-    prices_checked: 2026-06-09
-    price_comments: Imported from OpenRouter pricing; verify against Azure AI Foundry when native pricing is published.
+    context_window: 131072
+    prices_checked: 2026-10-19
     prices:
-      input_mtok: 0.08
-      output_mtok: 0.35
+      input_mtok: 0.075
+      output_mtok: 0.3
 
   - id: phi-4-multimodal-instruct
     name: Phi 4 Multimodal Instruct
@@ -259,9 +343,12 @@ models:
       post.
     match:
       equals: phi-4-multimodal-instruct
+    context_window: 131072
     prices:
-      input_mtok: 0.05
-      output_mtok: 0.1
+      input_mtok: 0.08
+      input_audio_mtok: 4
+      output_mtok: 0.32
+    prices_checked: 2026-10-19
 
   - id: phi-4-reasoning-plus
     name: Phi 4 Reasoning Plus
@@ -270,11 +357,15 @@ models:
       learning to boost accuracy on math, science, and code reasoning tasks. It
       uses the same dense decoder-only transformer architecture as Phi-4, but generates longer, more comprehensive outputs
       structured into a step-by-step reasoning trace and final answer.
+    # A different model from phi-4 (32K vs 16K context) that Azure happens to price the same.
+    collapse: false
     match:
       equals: phi-4-reasoning-plus
+    context_window: 32768
     prices:
-      input_mtok: 0.07
-      output_mtok: 0.35
+      input_mtok: 0.125
+      output_mtok: 0.5
+    prices_checked: 2026-10-19
 
   - id: phi-4-reasoning-plus:free
     name: Phi 4 Reasoning Plus (free)
@@ -285,6 +376,7 @@ models:
       structured into a step-by-step reasoning trace and final answer.
     match:
       equals: phi-4-reasoning-plus:free
+    context_window: 32768
     prices: {}
 
   - id: phi-4-reasoning:free
@@ -297,19 +389,23 @@ models:
       in a two-part format: reasoning trace followed by a final solution.
     match:
       equals: phi-4-reasoning:free
+    context_window: 32768
     prices: {}
 
   - id: text-embedding-3-large
+    # Azure documents 8,192 input tokens for both text-embedding-3 models: https://learn.microsoft.com/en-us/rest/api/microsoft-foundry/azureopenai/embeddings
+    canonical_model: openai/text-embedding-3-large
     match:
       equals: text-embedding-3-large
-    prices_checked: 2025-07-13
+    prices_checked: 2026-10-19
     prices:
       input_mtok: 0.13
 
   - id: text-embedding-3-small
+    canonical_model: openai/text-embedding-3-small
     match:
       equals: text-embedding-3-small
-    prices_checked: 2025-07-13
+    prices_checked: 2026-10-19
     prices:
       input_mtok: 0.02
 

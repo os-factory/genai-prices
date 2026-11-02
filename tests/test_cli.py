@@ -5,7 +5,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Collection, Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
@@ -45,7 +45,7 @@ def _use_registry(registry: UnitRegistry) -> Iterator[None]:
 
 
 def _find_model_ref(predicate: Callable[[ModelPrice], bool], *, exclude: Collection[str] = frozenset()) -> str:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return next(
         f'{provider.id}:{model.id}'
         for provider in providers
@@ -146,7 +146,7 @@ def test_calc(capsys: pytest.CaptureFixture[str]):
     assert out == snapshot("""\
       Provider: OpenAI
          Model: gpt 4o
-  Model Prices: $2.5/input MTok, $10/output MTok, $1.25/input cache read MTok
+  Model Prices: $2.5/input MTok, $10/output MTok, $1.25/input cache read MTok, $10/web searches K, $2.5/storage searches K
 Context Window: 128,000
    Input Price: $0.0025
   Output Price: $0.001
@@ -229,7 +229,8 @@ def test_calc_timestamp(capsys: pytest.CaptureFixture[str]):
     assert out == snapshot("""\
       Provider: OpenAI
          Model: o3
-  Model Prices: $2/input MTok, $8/output MTok, $0.5/input cache read MTok
+  Model Prices: $2/input MTok, $8/output MTok, $0.5/input cache read MTok, $10/web searches K, $2.5/storage searches K
+Context Window: 200,000
    Input Price: $0.02
   Output Price: $0
    Total Price: $0.02
@@ -242,7 +243,8 @@ def test_calc_timestamp(capsys: pytest.CaptureFixture[str]):
     assert out == snapshot("""\
       Provider: OpenAI
          Model: o3
-  Model Prices: $10/input MTok, $40/output MTok, $0.5/input cache read MTok
+  Model Prices: $10/input MTok, $40/output MTok, $0.5/input cache read MTok, $10/web searches K, $2.5/storage searches K
+Context Window: 200,000
    Input Price: $0.1
   Output Price: $0
    Total Price: $0.1
@@ -262,8 +264,9 @@ def test_list_provider(capsys: pytest.CaptureFixture[str]):
     assert cli_logic(['--plain', 'list', 'deepseek']) == 0
     out, err = capsys.readouterr()
     assert out == snapshot("""\
-Deepseek: (7 models)
+Deepseek: (8 models)
   deepseek:deepseek-chat: DeepSeek Chat
+  deepseek:deepseek-flash: DeepSeek V4.1 Flash
   deepseek:deepseek-reasoner: Deepseek R1
   deepseek:deepseek-v3.1-terminus: DeepSeek V3.1 Terminus
   deepseek:deepseek-v3.2: DeepSeek V3.2
@@ -352,6 +355,16 @@ def test_calc_no_color_vertical_table(capsys: pytest.CaptureFixture[str]):
     out, err = capsys.readouterr()
     assert 'Provider' in out
     assert 'Model Prices' in out
+    assert err == ''
+
+
+def test_calc_rich_model_without_context_window(capsys: pytest.CaptureFixture[str]):
+    # babbage is retired with no documented context window, so its record stays windowless;
+    # this keeps the None-row branch of the rich table covered regardless of data fills
+    assert cli_logic(['calc', '--no-color', '--input-tokens', '1000', 'openai:babbage']) == 0
+    out, err = capsys.readouterr()
+    assert 'Provider' in out
+    assert 'Context Window' not in out
     assert err == ''
 
 

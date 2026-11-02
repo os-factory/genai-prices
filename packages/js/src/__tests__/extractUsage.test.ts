@@ -7,6 +7,30 @@ import { data } from '../data'
 import { calcPrice, extractUsage } from '../index'
 
 const anthropicProvider: Provider = data.find((provider) => provider.id === 'anthropic')!
+const arceeProvider: Provider = data.find((provider) => provider.id === 'arcee')!
+const basetenProvider: Provider = data.find((provider) => provider.id === 'baseten')!
+const cursorProvider: Provider = data.find((provider) => provider.id === 'cursor')!
+const databricksProvider: Provider = data.find((provider) => provider.id === 'databricks')!
+const openaiDecisionsProvider: Provider = data.find((provider) => provider.id === 'openai-decisions')!
+const githubCopilotProvider: Provider = data.find((provider) => provider.id === 'github-copilot')!
+const metaProvider: Provider = data.find((provider) => provider.id === 'meta')!
+const fractionalProvider: Provider = {
+  api_pattern: 'fractional',
+  extractors: [
+    {
+      api_flavor: 'default',
+      mappings: [
+        { dest: 'audio_seconds', path: 'first_seconds', required: false },
+        { dest: 'audio_seconds', path: 'second_seconds', required: true },
+      ],
+      model_path: 'model',
+      root: 'usage',
+    },
+  ],
+  id: 'fractional',
+  models: [],
+  name: 'Fractional',
+}
 
 afterEach(() => {
   vi.restoreAllMocks()
@@ -14,6 +38,334 @@ afterEach(() => {
 
 describe('extractUsage', () => {
   describe('successful extraction', () => {
+    const metaUsageResponses: {
+      apiFlavor: 'chat' | 'responses'
+      usageData: Record<string, unknown>
+    }[] = [
+      {
+        apiFlavor: 'chat',
+        usageData: {
+          completion_tokens: 40,
+          completion_tokens_details: { reasoning_tokens: 10 },
+          prompt_tokens: 100,
+          prompt_tokens_details: { cached_tokens: 20 },
+        },
+      },
+      {
+        apiFlavor: 'responses',
+        usageData: {
+          input_tokens: 100,
+          input_tokens_details: { cached_tokens: 20 },
+          output_tokens: 40,
+          output_tokens_details: { reasoning_tokens: 10 },
+        },
+      },
+    ]
+
+    it.each(metaUsageResponses)('extracts Meta Muse Wonder $apiFlavor usage', ({ apiFlavor, usageData }) => {
+      const extracted = extractUsage(metaProvider, { model: 'muse-wonder-1.0', usage: usageData }, apiFlavor)
+
+      expect(extracted).toEqual({
+        model: 'muse-wonder-1.0',
+        usage: {
+          cache_read_tokens: 20,
+          input_tokens: 100,
+          output_reasoning_tokens: 10,
+          output_tokens: 40,
+        },
+      })
+    })
+
+    it('should extract Cursor usage events', () => {
+      const responseData = {
+        model: 'grok-4.6-fast',
+        tokenUsage: {
+          cacheReadTokens: 30,
+          cacheWriteTokens: 20,
+          inputTokens: 100,
+          outputTokens: 40,
+          totalCents: 0.099,
+        },
+      }
+
+      const { model, usage } = extractUsage(cursorProvider, responseData, 'usage-event')
+
+      expect(model).toBe('grok-4.6-fast')
+      expect(usage).toEqual({
+        cache_read_tokens: 30,
+        cache_write_tokens: 20,
+        input_tokens: 150,
+        output_tokens: 40,
+      })
+
+      const price = calcPrice(usage, model!, { providerId: 'cursor' })
+      expect(price?.input_price).toBeCloseTo(0.00051, 8)
+      expect(price?.output_price).toBeCloseTo(0.00048, 8)
+      expect(price?.total_price).toBeCloseTo(0.00099, 8)
+    })
+
+    it.each(['default', 'responses'] as const)('should extract OpenAI Decisions %s usage', (apiFlavor) => {
+      const responseData = {
+        model: 'gpt-6-luna',
+        usage: {
+          input_tokens: 1_000,
+          input_tokens_details: { cache_write_tokens: 50, cached_tokens: 200 },
+          output_tokens: 100,
+          output_tokens_details: { reasoning_tokens: 25 },
+        },
+      }
+
+      const { model, usage } = extractUsage(openaiDecisionsProvider, responseData, apiFlavor)
+
+      expect(model).toBe('gpt-6-luna')
+      expect(usage).toEqual({
+        cache_read_tokens: 200,
+        cache_write_tokens: 50,
+        input_tokens: 1_000,
+        output_reasoning_tokens: 25,
+        output_tokens: 100,
+      })
+      expect(
+        calcPrice(usage, model!, { providerId: 'openai-decisions', timestamp: new Date('2026-10-18T00:00:00Z') })?.total_price
+      ).toBeCloseTo(0.0001, 10)
+    })
+
+    it('should extract GitHub Copilot chat usage', () => {
+      // Recorded from POST https://api.githubcopilot.com/chat/completions on 2026-09-03.
+      const responseData = {
+        model: 'claude-haiku-4.5',
+        usage: {
+          completion_tokens: 8,
+          prompt_tokens: 15,
+          prompt_tokens_details: { cached_tokens: 4 },
+          total_tokens: 23,
+        },
+      }
+
+      const { model, usage } = extractUsage(githubCopilotProvider, responseData, 'chat')
+
+      expect(model).toBe('claude-haiku-4.5')
+      expect(usage).toEqual({
+        cache_read_tokens: 4,
+        input_tokens: 15,
+        output_tokens: 8,
+      })
+
+      const price = calcPrice(usage, model!, { providerId: 'github-copilot', timestamp: new Date('2026-10-17T00:00:00Z') })
+      expect(price?.total_price).toBeCloseTo(0.0000514, 10)
+    })
+
+    it('should extract GitHub Copilot responses usage', () => {
+      // Recorded from POST https://api.githubcopilot.com/responses on 2026-09-03, which answers a
+      // `gpt-5.4` request with the dated snapshot ID.
+      const responseData = {
+        model: 'gpt-5.4-2026-03-05',
+        object: 'response',
+        usage: {
+          input_tokens: 7,
+          input_tokens_details: { cache_write_tokens: 2, cached_tokens: 3 },
+          output_tokens: 11,
+          output_tokens_details: { reasoning_tokens: 4 },
+          total_tokens: 18,
+        },
+      }
+
+      const { model, usage } = extractUsage(githubCopilotProvider, responseData, 'responses')
+
+      expect(model).toBe('gpt-5.4-2026-03-05')
+      expect(usage).toEqual({
+        cache_read_tokens: 3,
+        cache_write_tokens: 2,
+        input_tokens: 7,
+        output_reasoning_tokens: 4,
+        output_tokens: 11,
+      })
+
+      const price = calcPrice(usage, model!, { providerId: 'github-copilot', timestamp: new Date('2026-10-17T00:00:00Z') })
+      expect(price?.model.id).toBe('gpt-5.4')
+      expect(price?.total_price).toBeCloseTo(0.00017575, 10)
+    })
+
+    it.each(['default', 'chat'])('should extract Arcee %s usage', (apiFlavor) => {
+      const responseData = {
+        model: 'deepseek/deepseek-v4-flash-latest',
+        usage: {
+          completion_tokens: 40,
+          completion_tokens_details: { reasoning_tokens: 10 },
+          prompt_tokens: 100,
+          prompt_tokens_details: { cached_tokens: 30 },
+        },
+      }
+
+      const { model, usage } = extractUsage(arceeProvider, responseData, apiFlavor)
+
+      expect(model).toBe('deepseek/deepseek-v4-flash-latest')
+      expect(usage).toEqual({
+        cache_read_tokens: 30,
+        input_tokens: 100,
+        output_reasoning_tokens: 10,
+        output_tokens: 40,
+      })
+    })
+
+    it('should extract Baseten chat usage', () => {
+      const responseData = {
+        model: 'zai-org/GLM-5.3-Flash',
+        usage: {
+          completion_tokens: 40,
+          completion_tokens_details: { audio_tokens: 3, reasoning_tokens: 10 },
+          prompt_tokens: 100,
+          prompt_tokens_details: { audio_tokens: 5, cached_tokens: 30 },
+        },
+      }
+
+      const { model, usage } = extractUsage(basetenProvider, responseData, 'chat')
+
+      expect(model).toBe('zai-org/GLM-5.3-Flash')
+      expect(usage).toEqual({
+        cache_read_tokens: 30,
+        input_audio_tokens: 5,
+        input_tokens: 100,
+        output_audio_tokens: 3,
+        output_reasoning_tokens: 10,
+        output_tokens: 40,
+      })
+    })
+
+    it('should extract Baseten Messages usage', () => {
+      const responseData = {
+        model: 'zai-org/GLM-5.3-Flash',
+        usage: { cache_read_input_tokens: 30, input_tokens: 70, output_tokens: 40 },
+      }
+
+      const { model, usage } = extractUsage(basetenProvider, responseData, 'anthropic')
+
+      expect(model).toBe('zai-org/GLM-5.3-Flash')
+      expect(usage).toEqual({ cache_read_tokens: 30, input_tokens: 100, output_tokens: 40 })
+    })
+
+    // The Databricks bodies follow the documented usage fields; no recorded response is public.
+    // https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/api-reference#usage
+    it.each(['default', 'chat'])('should extract Databricks %s usage', (apiFlavor) => {
+      const responseData = {
+        model: 'databricks-glm-5-3',
+        object: 'chat.completion',
+        usage: {
+          cache_read_input_tokens: 12_002,
+          completion_tokens: 80,
+          prompt_tokens: 12_011,
+          reasoning_tokens: 30,
+          total_tokens: 12_091,
+        },
+      }
+
+      const { model, usage } = extractUsage(databricksProvider, responseData, apiFlavor)
+
+      expect(model).toBe('databricks-glm-5-3')
+      expect(usage).toEqual({
+        cache_read_tokens: 12_002,
+        input_tokens: 12_011,
+        output_reasoning_tokens: 30,
+        output_tokens: 80,
+      })
+      expect(calcPrice(usage, model!, { providerId: 'databricks', timestamp: new Date('2026-10-17T00:00:00Z') })?.total_price).toBeCloseTo(
+        0.00348512,
+        12
+      )
+    })
+
+    it('should extract Databricks chat usage without cache or reasoning fields', () => {
+      const responseData = {
+        model: 'databricks-gpt-oss-120b',
+        object: 'chat.completion',
+        usage: { completion_tokens: 74, prompt_tokens: 7, total_tokens: 81 },
+      }
+
+      const { model, usage } = extractUsage(databricksProvider, responseData, 'chat')
+
+      expect(model).toBe('databricks-gpt-oss-120b')
+      expect(usage).toEqual({ input_tokens: 7, output_tokens: 74 })
+      expect(calcPrice(usage, model!, { providerId: 'databricks', timestamp: new Date('2026-10-17T00:00:00Z') })?.total_price).toBeCloseTo(
+        0.00004545,
+        12
+      )
+    })
+
+    it('should extract Databricks Open Responses usage', () => {
+      const responseData = {
+        model: 'databricks-kimi-k3',
+        object: 'response',
+        usage: {
+          input_tokens: 100,
+          input_tokens_details: { cached_tokens: 40 },
+          output_tokens: 50,
+          output_tokens_details: { reasoning_tokens: 20 },
+          total_tokens: 150,
+        },
+      }
+
+      const { model, usage } = extractUsage(databricksProvider, responseData, 'responses')
+
+      expect(model).toBe('databricks-kimi-k3')
+      expect(usage).toEqual({ cache_read_tokens: 40, input_tokens: 100, output_reasoning_tokens: 20, output_tokens: 50 })
+      expect(calcPrice(usage, model!, { providerId: 'databricks', timestamp: new Date('2026-10-17T00:00:00Z') })?.total_price).toBeCloseTo(
+        0.000942,
+        12
+      )
+    })
+
+    it('should extract Databricks embeddings usage', () => {
+      const responseData = {
+        data: [{ embedding: [0.1, 0.2], index: 0, object: 'embedding' }],
+        model: 'databricks-gte-large-en',
+        object: 'list',
+        usage: { prompt_tokens: 1_000_000, total_tokens: 1_000_000 },
+      }
+
+      const { model, usage } = extractUsage(databricksProvider, responseData, 'embeddings')
+
+      expect(model).toBe('databricks-gte-large-en')
+      expect(usage).toEqual({ input_tokens: 1_000_000 })
+      expect(calcPrice(usage, model!, { providerId: 'databricks', timestamp: new Date('2026-10-17T00:00:00Z') })?.total_price).toBeCloseTo(
+        0.13,
+        12
+      )
+    })
+
+    // 0.5M five-minute and 0.5M one-hour cache writes. The regional Bedrock endpoint carries a 10% premium.
+    it.each([
+      { expectedPrice: 4.875, model: 'global.anthropic.claude-sonnet-4-6', providerId: 'aws' },
+      { expectedPrice: 5.3625, model: 'us.anthropic.claude-sonnet-4-6', providerId: 'aws' },
+      { expectedPrice: 4.875, model: 'claude-sonnet-4-6', providerId: 'google' },
+      { expectedPrice: 4.875, model: 'claude-sonnet-4-6', providerId: 'azure' },
+    ])('should price Claude cache writes by TTL on $providerId ($model)', ({ expectedPrice, model, providerId }) => {
+      const provider = data.find((p) => p.id === providerId)!
+      const responseData = {
+        model,
+        usage: {
+          cache_creation: { ephemeral_1h_input_tokens: 500_000, ephemeral_5m_input_tokens: 500_000 },
+          cache_creation_input_tokens: 1_000_000,
+          cache_read_input_tokens: 0,
+          input_tokens: 0,
+          output_tokens: 0,
+        },
+      }
+
+      const { model: extractedModel, usage } = extractUsage(provider, responseData, 'anthropic')
+
+      expect(usage).toEqual({
+        cache_read_tokens: 0,
+        cache_write_1h_tokens: 500_000,
+        cache_write_5m_tokens: 500_000,
+        cache_write_tokens: 1_000_000,
+        input_tokens: 1_000_000,
+        output_tokens: 0,
+      })
+      expect(calcPrice(usage, extractedModel!, { providerId, timestamp: new Date('2026-10-17T00:00:00Z') })?.total_price).toBeCloseTo(
+        expectedPrice
+      )
+    })
+
     it('should extract usage with cache tokens', () => {
       const responseData = {
         id: 'msg_0152tnC3YpjyASTB9qxqDJXu',
@@ -72,6 +424,24 @@ describe('extractUsage', () => {
         input_tokens: 504,
         output_tokens: 97,
       })
+    })
+
+    it('should preserve and accumulate fractional values', () => {
+      const { usage } = extractUsage(fractionalProvider, {
+        model: 'fractional-model',
+        usage: { first_seconds: 0.1, second_seconds: 0.2 },
+      })
+
+      expect(usage.audio_seconds).toBeCloseTo(0.3, 15)
+    })
+
+    it('should preserve optional structural probing for non-number leaves', () => {
+      expect(
+        extractUsage(fractionalProvider, {
+          model: 'fractional-model',
+          usage: { first_seconds: 'unknown', second_seconds: 0.25 },
+        }).usage
+      ).toEqual({ audio_seconds: 0.25 })
     })
   })
 
@@ -175,6 +545,41 @@ describe('extractUsage', () => {
       })
     })
 
+    it.each(['openai', 'azure'])('should extract realtime cached audio usage for %s', (providerId) => {
+      const provider: Provider = data.find((candidate) => candidate.id === providerId)!
+      const responseData = {
+        response: {
+          usage: {
+            input_token_details: {
+              audio_tokens: 250,
+              cached_tokens: 400,
+              cached_tokens_details: { audio_tokens: 100, image_tokens: 50, text_tokens: 250 },
+              image_tokens: 150,
+              text_tokens: 600,
+            },
+            input_tokens: 1000,
+            output_token_details: { audio_tokens: 300, text_tokens: 200 },
+            output_tokens: 500,
+          },
+        },
+        type: 'response.done',
+      }
+
+      expect(extractUsage(provider, responseData, 'realtime').usage).toEqual({
+        cache_audio_read_tokens: 100,
+        cache_image_read_tokens: 50,
+        cache_read_tokens: 400,
+        cache_text_read_tokens: 250,
+        input_audio_tokens: 250,
+        input_image_tokens: 150,
+        input_text_tokens: 600,
+        input_tokens: 1000,
+        output_audio_tokens: 300,
+        output_text_tokens: 200,
+        output_tokens: 500,
+      })
+    })
+
     it('should error if not apiFlavor is provided', () => {
       const responseData = {
         model: 'gpt-5',
@@ -182,6 +587,107 @@ describe('extractUsage', () => {
       }
 
       expect(() => extractUsage(openaiProvider, responseData)).toThrow("Unknown apiFlavor 'default', allowed values: chat, responses")
+    })
+  })
+
+  describe('Cloudflare provider', () => {
+    const cloudflareProvider: Provider = data.find((provider) => provider.id === 'cloudflare')!
+
+    it('extracts the documented Clairic response without counting state or schema tokens twice', () => {
+      const { model, usage } = extractUsage(
+        cloudflareProvider,
+        {
+          errors: [],
+          messages: [],
+          result: {
+            model: 'clairic',
+            usage: { image_tokens: 0, input_tokens: 655, output_tokens: 0, passes: 3, schema_tokens: 472, state_tokens: 61 },
+          },
+          success: true,
+        },
+        'decisions'
+      )
+      expect(model).toBe('clairic')
+      expect(usage).toEqual({ input_tokens: 655, output_tokens: 0 })
+      expect(calcPrice(usage, model!, { providerId: 'cloudflare' })?.total_price).toBeCloseTo(0.0000655, 12)
+    })
+
+    it('should extract and price OpenAI-compatible chat usage', () => {
+      const { model, usage } = extractUsage(
+        cloudflareProvider,
+        {
+          model: '@cf/deepseek-ai/deepseek-v4-flash-0731',
+          usage: {
+            completion_tokens: 1_000_000,
+            completion_tokens_details: { reasoning_tokens: 500_000 },
+            prompt_tokens: 2_000_000,
+            prompt_tokens_details: { cached_tokens: 1_000_000 },
+          },
+        },
+        'chat'
+      )
+
+      expect(model).toBe('@cf/deepseek-ai/deepseek-v4-flash-0731')
+      expect(usage).toEqual({
+        cache_read_tokens: 1_000_000,
+        input_tokens: 2_000_000,
+        output_reasoning_tokens: 500_000,
+        output_tokens: 1_000_000,
+      })
+      if (!model) throw new Error('Expected extracted Cloudflare model')
+      expect(calcPrice(usage, model, { providerId: 'cloudflare' })?.total_price).toBeCloseTo(1.774)
+    })
+
+    it('should match the Cloudflare Workers AI endpoint', () => {
+      const price = calcPrice({ input_tokens: 1_000_000, output_tokens: 1_000_000 }, '@cf/openai/gpt-oss-20b', {
+        providerApiUrl: 'https://api.cloudflare.com/client/v4/accounts/test-account/ai/v1',
+      })
+
+      expect(price?.provider.id).toBe('cloudflare')
+      expect(price?.total_price).toBeCloseTo(0.5)
+    })
+
+    it('should extract and price native REST usage', () => {
+      const { model, usage } = extractUsage(cloudflareProvider, {
+        errors: [],
+        messages: [],
+        result: {
+          response: 'Hello',
+          usage: {
+            completion_tokens: 1_000_000,
+            prompt_tokens: 2_000_000,
+            total_tokens: 3_000_000,
+          },
+        },
+        success: true,
+      })
+
+      expect(model).toBeNull()
+      expect(usage).toEqual({ input_tokens: 2_000_000, output_tokens: 1_000_000 })
+      expect(calcPrice(usage, '@cf/meta/llama-3.2-1b-instruct', { providerId: 'cloudflare' })?.total_price).toBeCloseTo(0.255)
+    })
+  })
+
+  describe('Mistral provider', () => {
+    const mistralProvider: Provider = data.find((provider) => provider.id === 'mistral')!
+    const responseData = {
+      model: 'mistral-ocr-4-1-completion',
+      usage_info: { doc_size_bytes: 108_451_500, pages_processed: 29 },
+    }
+
+    it('extracts and prices OCR pages', () => {
+      const { model, usage } = extractUsage(mistralProvider, responseData, 'ocr')
+
+      expect(model).toBe('mistral-ocr-4-1-completion')
+      expect(usage).toEqual({ input_document_pages: 29 })
+      expect(calcPrice(usage, model!, { providerId: 'mistral' })?.total_price).toBeCloseTo(0.116)
+    })
+
+    it('extracts and prices annotated OCR pages', () => {
+      const { model, usage } = extractUsage(mistralProvider, responseData, 'ocr_annotated')
+
+      expect(usage).toEqual({ input_annotated_document_pages: 29, input_document_pages: 29 })
+      expect(calcPrice(usage, model!, { providerId: 'mistral' })?.total_price).toBeCloseTo(0.145)
     })
   })
 
@@ -222,6 +728,35 @@ describe('extractUsage', () => {
 
   describe('xAI provider', () => {
     const xaiProvider: Provider = data.find((provider) => provider.id === 'x-ai')!
+
+    it.each([true, false])('should extract and price responses usage with details=%s', (withDetails) => {
+      // Model and usage excerpt: https://docs.x.ai/developers/rest-api-reference/inference/responses
+      // https://docs.x.ai/cookbook/examples/prompt-caching confirms reasoning is included in output_tokens.
+      const responseData = {
+        model: 'grok-4.20-0309-reasoning',
+        usage: {
+          input_tokens: 131,
+          ...(withDetails ? { input_tokens_details: { cached_tokens: 128 } } : {}),
+          output_tokens: 624,
+          ...(withDetails ? { output_tokens_details: { reasoning_tokens: 246 } } : {}),
+          total_tokens: 755,
+        },
+      }
+
+      const { model, usage } = extractUsage(xaiProvider, responseData, 'responses')
+
+      expect(model).toBe('grok-4.20-0309-reasoning')
+      expect(usage).toEqual(
+        withDetails
+          ? { cache_read_tokens: 128, input_tokens: 131, output_reasoning_tokens: 246, output_tokens: 624 }
+          : { input_tokens: 131, output_tokens: 624 }
+      )
+      const price = calcPrice(usage, model!, { provider: xaiProvider })
+      expect(price!.model.id).toBe('grok-4.20')
+      expect(price!.input_price).toBeCloseTo(withDetails ? 0.00002935 : 0.00016375, 12)
+      expect(price!.output_price).toBeCloseTo(0.00156, 12)
+      expect(price!.total_price).toBeCloseTo(withDetails ? 0.00158935 : 0.00172375, 12)
+    })
 
     it('should add native reasoning tokens to aggregate output', () => {
       const responseData = {
@@ -269,10 +804,97 @@ describe('extractUsage', () => {
         output_tokens: 14,
       })
     })
+
+    it('should extract and price realtime duration and message usage', () => {
+      const responseData = {
+        response: { usage: {} },
+        type: 'response.done',
+        usage: {
+          billable_audio_seconds: 60,
+          input_text_messages: 2,
+          input_token_details: { audio_tokens: 0, text_tokens: 5 },
+          input_tokens: 5,
+          output_token_details: { audio_tokens: 39, text_tokens: 3 },
+          output_tokens: 42,
+        },
+      }
+
+      const { model, usage } = extractUsage(xaiProvider, responseData, 'realtime')
+
+      expect(model).toBeNull()
+      expect(usage).toEqual({
+        audio_seconds: 60,
+        input_audio_tokens: 0,
+        input_text_messages: 2,
+        input_text_tokens: 5,
+        input_tokens: 5,
+        output_audio_tokens: 39,
+        output_text_tokens: 3,
+        output_tokens: 42,
+      })
+      for (const [modelRef, timestamp, expectedTotal] of [
+        ['grok-voice-think-fast-1.0', undefined, 0.058],
+        ['grok-voice-think-fast-2.0', undefined, 0.088],
+        ['grok-voice-latest', new Date('2026-08-04T00:00:00Z'), 0.058],
+        ['grok-voice-latest', new Date('2026-08-05T00:00:00Z'), 0.088],
+      ] as const) {
+        const price = calcPrice(usage, modelRef, { provider: xaiProvider, timestamp })
+        expect(price).not.toBeNull()
+        expect(price!.input_price).toBeCloseTo(0.008, 15)
+        expect(price!.output_price).toBe(0)
+        expect(price!.total_price).toBeCloseTo(expectedTotal, 15)
+      }
+    })
   })
 
   describe('Perplexity provider', () => {
     const perplexityProvider: Provider = data.find((provider) => provider.id === 'perplexity')!
+
+    it.each([true, false])('should extract and price responses usage with details=%s', (withDetails) => {
+      // Constructed from the Agent schema/model and Perplexity's own synthetic usage test, not a recording:
+      // https://docs.perplexity.ai/docs/agent-api/models
+      // https://github.com/perplexityai/wandr/blob/9ea23c7f24d0aaabc2c87b26815a513001b2e7ce/agents/relay/tests/test_perplexity_usage.py
+      // https://docs.perplexity.ai/docs/agent-api/tools/web-search
+      const responseData = {
+        model: 'perplexity/sonar',
+        object: 'response',
+        usage: {
+          input_tokens: 1000,
+          ...(withDetails ? { input_tokens_details: { cache_read_input_tokens: 800, cached_tokens: 300 } } : {}),
+          output_tokens: 100,
+          ...(withDetails ? { output_tokens_details: { reasoning_tokens: 50 } } : {}),
+          ...(withDetails ? { tool_calls_details: { search_web: { invocation: 2 } } } : {}),
+          total_tokens: 1100,
+        },
+      }
+
+      const { model, usage } = extractUsage(perplexityProvider, responseData, 'responses')
+
+      expect(model).toBe('perplexity/sonar')
+      expect(usage).toEqual(
+        withDetails
+          ? { cache_read_tokens: 800, input_tokens: 1000, output_reasoning_tokens: 50, output_tokens: 100, web_searches: 2 }
+          : { input_tokens: 1000, output_tokens: 100 }
+      )
+      for (const [month, day, priceContext, expectedTotal] of [
+        [10, 15, undefined, 0.00535],
+        [10, 15, { search_type: 'web' }, 0.00535],
+        [9, 23, { search_type: 'fast' }, 0.00235],
+        [9, 24, { search_type: 'fast' }, 0.00235],
+        [10, 14, { search_type: 'fast' }, 0.00235],
+        [10, 15, { search_type: 'fast' }, 0.00235],
+      ] as const) {
+        const price = calcPrice(usage, model!, {
+          priceContext,
+          provider: perplexityProvider,
+          timestamp: new Date(Date.UTC(2026, month - 1, day)),
+        })
+        expect(price!.model.id).toBe('perplexity/sonar')
+        expect(price!.input_price).toBeCloseTo(withDetails ? 0.0001 : 0.00025, 12)
+        expect(price!.output_price).toBeCloseTo(0.00025, 12)
+        expect(price!.total_price).toBeCloseTo(withDetails ? expectedTotal : 0.0005, 12)
+      }
+    })
 
     it('should add separately reported output categories to aggregate output', () => {
       const responseData = {
@@ -342,6 +964,17 @@ describe('extractUsage', () => {
       [{ model: 'x', usage: { input_tokens: [] } }, 'Expected `usage.input_tokens` value to be a number, got array'],
     ])('should throw error for invalid data: %j', (responseData, expectedError) => {
       expect(() => extractUsage(anthropicProvider, responseData)).toThrow(expectedError)
+    })
+
+    it.each([
+      ['negative optional component', { first_seconds: -1, second_seconds: 2 }],
+      ['NaN optional component', { first_seconds: Number.NaN, second_seconds: 2 }],
+      ['infinite optional component', { first_seconds: Number.POSITIVE_INFINITY, second_seconds: 2 }],
+      ['negative required component', { first_seconds: 2, second_seconds: -1 }],
+    ])('should reject invalid numeric components before accumulation: %s', (_name, usage) => {
+      expect(() => extractUsage(fractionalProvider, { model: 'fractional-model', usage })).toThrow(
+        'Invalid usage value for audio_seconds: expected a finite non-negative number'
+      )
     })
 
     it('should throw when a required nested path has the wrong intermediate shape', () => {
@@ -650,6 +1283,41 @@ describe('extractUsage', () => {
       const { usage } = extractUsage(bedrockProvider, responseData)
 
       expect(usage).toEqual({ cache_read_tokens: 0, cache_write_tokens: 11207, input_tokens: 11216, output_tokens: 5 })
+    })
+
+    // 0.75M five-minute and 0.25M one-hour cache writes. The regional endpoint carries a 10% premium.
+    it.each([
+      { expectedPrice: 4.3125, model: 'global.anthropic.claude-sonnet-4-6' },
+      { expectedPrice: 4.74375, model: 'us.anthropic.claude-sonnet-4-6' },
+    ])('should price Converse cache writes by TTL ($model)', ({ expectedPrice, model }) => {
+      const responseData = {
+        model,
+        usage: {
+          cacheDetails: [
+            { inputTokens: 250_000, ttl: '1h' },
+            { inputTokens: 750_000, ttl: '5m' },
+          ],
+          cacheReadInputTokens: 0,
+          cacheWriteInputTokens: 1_000_000,
+          inputTokens: 0,
+          outputTokens: 0,
+          totalTokens: 1_000_000,
+        },
+      }
+
+      const { model: extractedModel, usage } = extractUsage(bedrockProvider, responseData)
+
+      expect(usage).toEqual({
+        cache_read_tokens: 0,
+        cache_write_1h_tokens: 250_000,
+        cache_write_5m_tokens: 750_000,
+        cache_write_tokens: 1_000_000,
+        input_tokens: 1_000_000,
+        output_tokens: 0,
+      })
+      expect(
+        calcPrice(usage, extractedModel!, { providerId: 'aws', timestamp: new Date('2026-10-17T00:00:00Z') })?.total_price
+      ).toBeCloseTo(expectedPrice)
     })
 
     it('should extract Converse usage with cache read tokens', () => {

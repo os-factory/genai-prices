@@ -14,6 +14,41 @@ provider_match:
     - contains: huggingface
     - contains: cerebras
 extractors:
+  - api_flavor: default
+    root: usage
+    model_path: model
+    mappings:
+      - path: prompt_tokens
+        dest: input_tokens
+        required: true
+      - path:
+          - prompt_tokens_details
+          - cached_tokens
+        dest: cache_read_tokens
+        required: false
+      - path:
+          - prompt_tokens_details
+          - cache_write_tokens
+        dest: cache_write_tokens
+        required: false
+      - path:
+          - prompt_tokens_details
+          - audio_tokens
+        dest: input_audio_tokens
+        required: false
+      - path:
+          - completion_tokens_details
+          - audio_tokens
+        dest: output_audio_tokens
+        required: false
+      - path:
+          - completion_tokens_details
+          - reasoning_tokens
+        dest: output_reasoning_tokens
+        required: false
+      - path: completion_tokens
+        dest: output_tokens
+        required: true
   - api_flavor: chat
     root: usage
     model_path: model
@@ -28,6 +63,11 @@ extractors:
         required: false
       - path:
           - prompt_tokens_details
+          - cache_write_tokens
+        dest: cache_write_tokens
+        required: false
+      - path:
+          - prompt_tokens_details
           - audio_tokens
         dest: input_audio_tokens
         required: false
@@ -36,10 +76,27 @@ extractors:
           - audio_tokens
         dest: output_audio_tokens
         required: false
+      - path:
+          - completion_tokens_details
+          - reasoning_tokens
+        dest: output_reasoning_tokens
+        required: false
       - path: completion_tokens
         dest: output_tokens
         required: true
 models:
+  - id: Qwen/Qwen3.8-27B
+    name: Qwen3.8-27B
+    match:
+      or:
+        - equals: qwen/qwen3.8-27b
+        - equals: qwen/qwen3.8-27b-fast
+    context_window: 65536
+    prices:
+      input_mtok: 0.99
+      output_mtok: 1.49
+    prices_checked: 2026-10-20
+
   - id: meta-llama/Llama-3.1-8B-Instruct
     name: Llama-3.1-8B-Instruct
     match:
@@ -49,3 +106,15 @@ models:
     prices:
       input_mtok: 0.1
       output_mtok: 0.1
+
+  - id: openai/gpt-oss-120b
+    name: gpt-oss-120b
+    match:
+      or:
+        - equals: openai/gpt-oss-120b
+        - equals: openai/gpt-oss-120b-fast
+    context_window: 131072
+    prices:
+      input_mtok: 0.35
+      output_mtok: 0.75
+    prices_checked: 2026-10-20

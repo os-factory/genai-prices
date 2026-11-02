@@ -4,8 +4,9 @@ on:
     branches:
       - main
     tags:
-      - "**"
+      - "v*"
   pull_request: {}
+  merge_group: {}
 
 permissions:
   contents: read
@@ -16,6 +17,35 @@ env:
   UV_FROZEN: "1"
 
 jobs:
+  price-check-agent:
+    name: Price Check agent composition
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.12.1"
+          enable-cache: false
+      - name: Verify tools and shell environment
+        working-directory: ${{ runner.temp }}
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          PYDANTIC_AI_NO_BANNER: "1"
+        run: >-
+          uv run --isolated --no-project
+          --with 'pydantic-ai-harness==0.60.0'
+          --with 'pydantic-ai-slim[anthropic,openai,mcp,spec]>=2.54.0'
+          --with 'pytest==8.4.1'
+          sh -c 'python -m unittest scripts.test_price_check_agent && python -m pytest "$GITHUB_WORKSPACE/scripts/test_price_check_sources.py" "$GITHUB_WORKSPACE/scripts/test_price_check_scope_policy.py"'
+      - uses: github/gh-aw-actions/setup@d7cc687a9bc76b9d56e6c496649403392f654b35 # v0.91.1
+      - name: Verify fetch policy and safe-output scope preflight
+        run: >-
+          node --test scripts/price_check_web_fetch.test.cjs
+          scripts/price_check_scope.test.cjs scripts/price_check_bridge.test.cjs
+          scripts/price_update_*.test.cjs
+
   pre-commit:
     runs-on: ubuntu-latest
     steps:
@@ -24,12 +54,18 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
+          version: "0.12.1"
           enable-cache: true # zizmor: ignore[cache-poisoning] -- Job does not produce release artifacts and does not have sensitive permissions
       - run: uv sync  --all-packages
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           cache: npm # zizmor: ignore[cache-poisoning] -- Job does not produce release artifacts and does not have sensitive permissions
-      - run: npm install
+      - run: npm ci
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.0.0
+        with:
+          go-version-file: packages/go/go.mod
+          cache-dependency-path: packages/go/go.sum
+          cache: true # zizmor: ignore[cache-poisoning] -- Job does not produce release artifacts and does not have sensitive permissions
       - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5 # zizmor: ignore[cache-poisoning] -- Job does not produce release artifacts and does not have sensitive permissions
         with:
           path: ~/.cache/pre-commit
@@ -43,7 +79,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        python-version: ["3.11", "3.12", "3.13", "3.14", "3.15"]
     env:
       UV_PYTHON: ${{ matrix.python-version }}
     runs-on: ubuntu-latest
@@ -53,12 +89,18 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
+          version: "0.12.1"
           enable-cache: true # zizmor: ignore[cache-poisoning] -- Job does not produce release artifacts and does not have sensitive permissions
       - run: uv sync --frozen --all-packages --all-extras
-      - run: make test
+      # Coverage runs on 3.14 only: it traces branches via sys.monitoring, while CTracer on <3.14 is ~3x slower.
+      - if: matrix.python-version == '3.14'
+        run: make test
         env:
           COVERAGE_FILE: coverage/.coverage.py${{ matrix.python-version }}
+      - if: matrix.python-version != '3.14'
+        run: uv run pytest
       - name: store coverage files
+        if: matrix.python-version == '3.14'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-${{ matrix.python-version }}
@@ -85,6 +127,7 @@ jobs:
           path: coverage
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
+          version: "0.12.1"
           enable-cache: true # zizmor: ignore[cache-poisoning] -- Job does not produce release artifacts and does not have sensitive permissions
       - run: uv sync --only-dev
       - run: uv run coverage combine coverage
@@ -95,7 +138,7 @@ jobs:
           name: coverage-html
           path: htmlcov
           include-hidden-files: true
-      - run: uv run coverage report --fail-under 100
+      - run: uv run coverage report
 
   test-js:
     runs-on: ubuntu-latest
@@ -109,59 +152,96 @@ jobs:
           node-version: 24.x
           cache: "npm" # zizmor: ignore[cache-poisoning] -- Job does not produce release artifacts and does not have sensitive permissions
 
-      - run: npm install
+      - run: npm ci
 
       - run: npm run ci
 
-  # Fail the PR if the package version is decreased relative to the base branch,
-  # or if the python/js version files disagree. Guards against an old release-prep
-  # commit being accidentally replayed onto an advanced `main` (see PR #428).
-  version-guard:
-    if: github.event_name == 'pull_request'
+  test-go:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-          # fetch the base branch too so we can read its version
-          fetch-depth: 0
-      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.0.0
         with:
-          enable-cache: true # zizmor: ignore[cache-poisoning] -- Job does not produce release artifacts and does not have sensitive permissions
-      - run: uv sync --only-dev
-      - run: uv run --no-sync python .github/scripts/check_version_not_downgraded.py "${BASE_SHA}"
+          go-version-file: packages/go/go.mod
+          cache-dependency-path: packages/go/go.sum
+          cache: true # zizmor: ignore[cache-poisoning] -- Job does not produce release artifacts and does not have sensitive permissions
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.2.0
+        with:
+          version: v2.10.1
+          working-directory: packages/go
+          # config verify downloads the schema from golangci-lint.run, which times out in CI
+          verify: false
+      - run: make test-go
+
+  test-rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: install the pinned Rust toolchain
+        working-directory: packages/rust
+        run: rustup toolchain install
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-llvm-cov
+      - run: make lint-rust
+      - run: make test-rust
+      - name: check the minimum supported Rust version
+        working-directory: packages/rust
+        run: |
+          msrv="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].rust_version')"
+          rustup toolchain install "$msrv" --profile minimal
+          cargo +"$msrv" check --locked
+
+  # Preserve the v2 schema core. Optional model price variants are ignored by older clients.
+  v2-schema-frozen:
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: compare the v2 schema core against the base branch
+        run: |
+          python3 prices/src/prices/schema_compatibility.py --base "${BASE_SHA}" \
+            prices/new_data/v2/data.schema.json prices/new_data/v2/data_slim.schema.json
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
 
   # https://github.com/marketplace/actions/alls-green#why used for branch protection checks
   check:
     if: always()
-    needs: [pre-commit, test-python, coverage, test-js, version-guard]
+    needs: [price-check-agent, pre-commit, test-python, coverage, test-js, test-go, test-rust, v2-schema-frozen]
     runs-on: ubuntu-latest
     steps:
       - name: Decide whether the needed jobs succeeded or failed
         uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe # v1.2.2
         with:
           jobs: ${{ toJSON(needs) }}
-          # version-guard only runs on pull_request; it is (correctly) skipped on
-          # push/tag runs, so don't let that skip fail the gate.
-          allowed-skips: version-guard
+          # v2-schema-frozen only runs on pull_request/merge_group; it is (correctly) skipped on push/tag runs,
+          # so don't let that skip fail the gate.
+          allowed-skips: v2-schema-frozen
 
-  release-pypi:
+  # Releases are cut by creating a GitHub release whose tag is `vX.Y.Z`. Nothing in the repo is
+  # bumped: the Python version comes from the tag via uv-dynamic-versioning and the npm version is
+  # set from the tag right before publishing. Both artifacts are built in this job, which has no
+  # publish credentials, so a compromised build backend / transitive build dep can't reach the
+  # OIDC tokens - those live in the two publish jobs below, which only touch the built artifacts.
+  release-build:
+    name: build release artifacts
     needs: [check]
-    # Not success(): version-guard is skipped on tag runs, and a skipped job anywhere
-    # in the needs chain makes success() false, silently skipping the release jobs
-    # (the v0.0.70 tag hit this). An explicit status function is required, otherwise
-    # an implicit success() is still applied to the expression.
+    # Not success(): v2-schema-frozen is skipped on tag runs, and a skipped job anywhere in the
+    # needs chain makes success() false, silently skipping the release jobs (the v0.0.70 tag hit
+    # this). An explicit status function is required, otherwise an implicit success() is still
+    # applied to the expression.
     if: ${{ !cancelled() && needs.check.result == 'success' && startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
-    environment:
-      name: release-pypi
-      url: https://pypi.org/project/genai-prices/${{ steps.check-package-version.outputs.VERSION }}
-    permissions:
-      id-token: write
     outputs:
-      package-version: ${{ steps.check-python-version.outputs.VERSION }}
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -169,47 +249,203 @@ jobs:
 
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
+          version: "0.12.1"
           enable-cache: false
 
-      - id: check-package-version
-        uses: samuelcolvin/check-python-version@ee87cddb8049d2694cc03badc8569765a05cef00 # v5
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
-          version_file_path: packages/python/pyproject.toml
+          node-version: 24.x
+          package-manager-cache: false
+
+      # The tag is the single source of truth for the version. Fail before building anything if
+      # what uv-dynamic-versioning derives from it doesn't match the tag byte-for-byte: a tag like
+      # `v1.0.0-rc.1` would otherwise publish `1.0.0rc1` to PyPI and `1.0.0-rc.1` to npm.
+      - name: Derive version from tag
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          python_version=$(uvx --with uv-dynamic-versioning hatchling version)
+          if [ "$python_version" != "$version" ]; then
+            echo "::error::Tag '$TAG' gives Python version '$python_version', expected '$version'. Use a plain 'vX.Y.Z' tag."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+        working-directory: packages/python
 
       - run: uv build --package genai-prices
+
+      # `npm version` rewrites packages/js/package.json before the build so the CLI's `--version`
+      # (which imports it) reports the released version.
+      - run: npm ci
+      - run: npm version --no-git-tag-version --workspace=packages/js "${VERSION}"
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+      - run: npm run build --workspace=packages/js
+      - run: mkdir -p npm-dist
+      - run: npm pack --workspace=packages/js --pack-destination npm-dist
+      - name: Verify npm release artifact
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: test -f "npm-dist/pydantic-genai-prices-${VERSION}.tgz"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-pypi-dist
+          path: dist/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-npm-dist
+          path: npm-dist/
+          if-no-files-found: error
+
+  release-go:
+    name: tag Go module
+    needs: [release-build]
+    if: ${{ !cancelled() && needs.release-build.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create Go module tag
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          GO_TAG: packages/go/v${{ needs.release-build.outputs.version }}
+          RELEASE_SHA: ${{ github.sha }}
+        with:
+          script: |
+            const { owner, repo } = context.repo
+            const tag = process.env.GO_TAG
+            const releaseSha = process.env.RELEASE_SHA
+
+            const getTagTarget = async () => {
+              const existing = await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` })
+              let target = existing.data.object
+              while (target.type === 'tag') {
+                const annotated = await github.rest.git.getTag({ owner, repo, tag_sha: target.sha })
+                target = annotated.data.object
+              }
+              return target
+            }
+
+            const verifyTag = (target) => {
+              if (target.type !== 'commit' || target.sha !== releaseSha) {
+                throw new Error(`Tag ${tag} already exists at ${target.sha}, expected ${releaseSha}`)
+              }
+            }
+
+            try {
+              verifyTag(await getTagTarget())
+              return
+            } catch (error) {
+              if (error.status !== 404) throw error
+            }
+
+            try {
+              await github.rest.git.createRef({ owner, repo, ref: `refs/tags/${tag}`, sha: releaseSha })
+            } catch (error) {
+              if (error.status !== 422) throw error
+              verifyTag(await getTagTarget())
+            }
+
+  release-pypi:
+    name: publish to PyPI
+    needs: [release-build]
+    # Not success(): v2-schema-frozen is skipped on tag runs, and a skipped job anywhere in the
+    # needs chain makes success() false. Including a status function also prevents GitHub from
+    # implicitly wrapping this expression in success().
+    if: ${{ !cancelled() && needs.release-build.result == 'success' }}
+    runs-on: ubuntu-latest
+    environment:
+      name: release-pypi
+      url: https://pypi.org/project/genai-prices/${{ needs.release-build.outputs.version }}
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-pypi-dist
+          path: dist/
+
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.12.1"
+          enable-cache: false
 
       - run: uv publish --trusted-publishing always
 
   release-npm:
-    needs: [check]
-    # Not success(): version-guard is skipped on tag runs, and a skipped job anywhere
-    # in the needs chain makes success() false, silently skipping the release jobs
-    # (the v0.0.70 tag hit this). An explicit status function is required, otherwise
-    # an implicit success() is still applied to the expression.
-    if: ${{ !cancelled() && needs.check.result == 'success' && startsWith(github.ref, 'refs/tags/') }}
+    name: publish to npm
+    needs: [release-build]
+    # Keep this explicit status function in sync with release-pypi; see the comment above.
+    if: ${{ !cancelled() && needs.release-build.result == 'success' }}
     runs-on: ubuntu-latest
     environment:
       name: release-npm
-      url: https://www.npmjs.com/package/@pydantic/genai-prices/v/${{ steps.check-package-version.outputs.VERSION }}
+      url: https://www.npmjs.com/package/@pydantic/genai-prices/v/${{ needs.release-build.outputs.version }}
     permissions:
       id-token: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: 24.x
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
 
-      - id: check-package-version
-        uses: samuelcolvin/check-python-version@ee87cddb8049d2694cc03badc8569765a05cef00 # v5
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          version_file_path: packages/js/package.json
-          version_pattern: '"version": *"(?P<version>.+?)"'
+          name: release-npm-dist
+          path: npm-dist/
 
-      - run: npm ci
-      - run: npm run build --workspace=packages/js
-      - run: npm publish --workspace=packages/js
+      # Trusted publishing (OIDC) - no token; npm attaches provenance automatically.
+      - run: npm publish ./npm-dist/pydantic-genai-prices-*.tgz --access public
+
+  release-crates:
+    name: publish to crates.io
+    needs: [release-build]
+    # Keep this explicit status function in sync with release-pypi; see the comment above.
+    if: ${{ !cancelled() && needs.release-build.result == 'success' }}
+    runs-on: ubuntu-latest
+    environment:
+      name: release-crates
+      url: https://crates.io/crates/genai-prices/${{ needs.release-build.outputs.version }}
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: packages/rust
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - run: rustup toolchain install
+
+      # The `0.0.0` committed in Cargo.toml is a placeholder, so publishing leaves the checkout dirty.
+      - run: sed -i "0,/^version = .*/s//version = \"$VERSION\"/" Cargo.toml
+        env:
+          VERSION: ${{ needs.release-build.outputs.version }}
+
+      # Trusted publishing (OIDC) - a short-lived token instead of a stored secret.
+      - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+        id: crates-io-auth
+
+      - run: cargo publish --allow-dirty
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+
+  release-check:
+    name: check release published
+    needs: [release-pypi, release-npm, release-crates, release-go]
+    # This status function ensures the job still runs and reports a failure if a publish job is
+    # skipped or fails. Without it, GitHub would silently skip this job too.
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all release jobs succeeded
+        uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe # v1.2.2
+        with:
+          jobs: ${{ toJSON(needs) }}

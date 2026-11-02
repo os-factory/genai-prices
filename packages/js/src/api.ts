@@ -2,6 +2,7 @@ import type {
   ConditionalPrice,
   PriceCalculationResult,
   PriceOptions,
+  PriceVariant,
   Provider,
   ProviderDataPayload,
   ProviderFindOptions,
@@ -12,6 +13,7 @@ import type {
 import { data as embeddedData } from './data'
 import { calcPrice as calcPriceInternal, getActiveModelPrice, matchModelWithFallback, matchProvider } from './engine'
 import { utcTimeOfDaySeconds } from './timeOfDay'
+import { validateUsageValue } from './usage'
 import { warnUnsupportedExtractorDestinations } from './validation'
 
 export const REMOTE_DATA_JSON_URL = 'https://raw.githubusercontent.com/pydantic/genai-prices/main/prices/new_data/v2/data.json'
@@ -70,6 +72,20 @@ function normalizeProvider(provider: Provider): Provider {
     ...provider,
     models: provider.models.map((model) => ({
       ...model,
+      price_variants: model.price_variants?.map((variant) => {
+        if (!isRecord(variant.prices)) throw new Error('Price variant prices must be an object')
+        if (
+          !isRecord(variant.when) ||
+          !Object.keys(variant.when).length ||
+          Object.values(variant.when).some((value) => typeof value !== 'string')
+        ) {
+          throw new Error('Price variant when must contain at least one string value')
+        }
+        return {
+          ...normalizeConditionalPrice({ ...variant, constraint: variant.constraint ?? undefined }, provider.id, model.id),
+          when: variant.when,
+        } as PriceVariant
+      }),
       prices: Array.isArray(model.prices)
         ? model.prices.map((price) => normalizeConditionalPrice(price, provider.id, model.id))
         : model.prices,
@@ -226,8 +242,23 @@ export function calcPrice(usage: Usage, modelId: string, options?: PriceOptions)
   const model = matchModelWithFallback(provider, lowerModelId, providerData)
   if (!model) return null
   const timestamp = options?.timestamp ?? new Date()
-  const modelPrice = getActiveModelPrice(model, timestamp)
-  const priceResult = calcPriceInternal(usage, modelPrice)
+  const ownsModel = provider.models.includes(model)
+  const modelPrice = getActiveModelPrice(model, timestamp, ownsModel ? options?.priceContext : undefined)
+  let billedUsage = usage
+  if (provider.id === 'groq' && (model.id === 'whisper-large-v3' || model.id === 'whisper-large-v3-turbo')) {
+    billedUsage = { ...usage }
+    const audioSeconds = billedUsage.audio_seconds
+    const inputAudioSeconds = billedUsage.input_audio_seconds
+    if (audioSeconds !== undefined) validateUsageValue('audio_seconds', audioSeconds)
+    if (inputAudioSeconds !== undefined) validateUsageValue('input_audio_seconds', inputAudioSeconds)
+    const reportedSeconds = audioSeconds === 0 ? inputAudioSeconds : (audioSeconds ?? inputAudioSeconds)
+    if (reportedSeconds !== undefined) {
+      const billedSeconds = reportedSeconds > 0 ? Math.max(reportedSeconds, 10) : 0
+      billedUsage.audio_seconds = billedSeconds
+      billedUsage.input_audio_seconds = billedSeconds
+    }
+  }
+  const priceResult = calcPriceInternal(billedUsage, modelPrice)
   return {
     auto_update_timestamp: undefined,
     model,

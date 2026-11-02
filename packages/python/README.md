@@ -51,6 +51,108 @@ price_data = calc_price(
 print(f"Total Price: ${price_data.total_price} (input: ${price_data.input_price}, output: ${price_data.output_price})")
 ```
 
+### Request pricing context
+
+```python
+from datetime import datetime, timezone
+
+from genai_prices import Usage, calc_price
+
+price = calc_price(
+    Usage(input_tokens=1_000_000, output_tokens=1_000_000),
+    model_ref='o3',
+    provider_id='openai',
+    genai_request_timestamp=datetime(2026, 10, 12, tzinfo=timezone.utc),
+    price_context={'service_tier': 'flex'},
+)
+assert price.total_price == 5
+```
+
+You pass `price_context` explicitly to select request-specific prices. Its keys and values are strings.
+Use the `service_tier` reported in OpenAI's response. The response can report `default` after a priority request
+is downgraded. `auto` is a request setting and does not identify the rate you were charged.
+
+OpenAI variants cover `flex`, `priority`, and `fast` where the published rate table supports them.
+`default` selects standard prices on these models. Omit the context for ordinary standard pricing.
+You can also pass it to `ExtractedUsage.calc_price()`, `ModelInfo.calc_price()`, and `DataSnapshot.calc()`.
+Extraction does not infer a pricing context.
+Tier variants are specific to their provider. If model lookup falls back to another provider, you receive the
+standard-price estimate; the fallback provider's tier rates are not applied.
+
+If a context matches no variant, you receive the standard-price estimate.
+This includes unsupported models, unknown tiers, misspelled keys, and dates without verified tier rates.
+The bundled tier rates are verified from October 12, 2026; earlier tier history is not modeled.
+
+### Batch API
+
+```python
+from datetime import datetime, timezone
+
+from genai_prices import Usage, calc_price
+
+price = calc_price(
+    Usage(input_tokens=1_000_000, output_tokens=1_000_000),
+    model_ref='o3',
+    provider_id='openai',
+    genai_request_timestamp=datetime(2026, 10, 14, tzinfo=timezone.utc),
+    price_context={'processing': 'batch'},
+)
+assert price.total_price == 5
+```
+
+You pass `{'processing': 'batch'}` for usage from a provider's batch API. Most providers do not mark batch results in
+the response, so you set it yourself. Batch is a separate key from `service_tier` because it is a way of submitting
+requests, not a tier: OpenAI batch results report `service_tier: "default"`.
+
+Batch rates are bundled for Anthropic, OpenAI, Google, Mistral, Groq and xAI, verified from October 14, 2026.
+A model the provider does not serve in batch returns the standard-price estimate.
+
+### Perplexity web search
+
+For `perplexity/sonar`, pass the search type used in the Perplexity request:
+
+```python
+from genai_prices import Usage, calc_price
+
+price = calc_price(
+    Usage(web_searches=2),
+    model_ref='perplexity/sonar',
+    provider_id='perplexity',
+    price_context={'search_type': 'fast'},
+)
+print(price.total_price)  # 0.0020
+```
+
+The response reports the search count but not the search type, so extraction cannot select the rate automatically.
+Pass `search_type: fast` even when a Perplexity preset selects Fast Search. Omitting the context or passing
+`search_type: web` uses the standard estimate of $2.50 per thousand searches. The fast rate is $1 per thousand.
+The search type selects the rate independently of the request date. Token charges are calculated separately.
+See [Perplexity's web-search documentation](https://docs.perplexity.ai/docs/agent-api/tools/web-search).
+
+### Cached input tokens
+
+```python
+from genai_prices import Usage, calc_price
+
+price_data = calc_price(
+    Usage(
+        input_tokens=4740,
+        cache_read_tokens=0,
+        cache_write_tokens=4735,
+        output_tokens=255,
+    ),
+    model_ref='claude-sonnet-4-20250514',
+    provider_id='anthropic',
+)
+print(price_data.total_price)
+```
+
+`input_tokens` is the total number of input tokens. It includes uncached tokens, cache-read tokens, and cache-write
+tokens. You also report `cache_read_tokens` and `cache_write_tokens` so that `calc_price` can apply their separate rates.
+
+Do not pass only the uncached count as `input_tokens`. Cache tokens are partitions of the total, so their combined count
+cannot exceed `input_tokens`.
+
 ### `extract_usage`
 
 `extract_usage` can be used to extract usage data and the `model_ref` from response data,
@@ -89,7 +191,7 @@ print(price.total_price)
 
 ### `UpdatePrices`
 
-`UpdatePrices` can be used to periodically update the price data by downloading it from GitHub
+`UpdatePrices` can be used to periodically update the price data by downloading it from GitHub.
 
 Please note:
 
@@ -101,7 +203,7 @@ generally very quick to download.
 
 By default `UpdatePrices` downloads price data immediately after it's started in the background, then every hour after that.
 
-Usage with `UpdatePrices` as as context manager:
+Usage with `UpdatePrices` as a context manager:
 
 ```py
 from genai_prices import UpdatePrices, Usage, calc_price
@@ -124,7 +226,17 @@ print(p)
 update_prices.stop()  # stop updating prices
 ```
 
-Only one `UpdatePrices` instance can be running at a time.
+All `UpdatePrices` instances use one background task. Each instance keeps the task running from `start()` until
+`stop()`. When an instance starts, it supplies the settings and `fetch()` method for future fetches. Calling `start()`
+again while that instance remains started has no effect unless `wait` is set. This lets libraries such as Logfire and
+Pydantic AI update prices without creating duplicate tasks. If you customize `fetch()`, start your instance after
+other libraries start theirs.
+
+Fetch failures are logged. If the latest fetch failed, `wait()` raises its error while its instance is started. The
+global wait functions raise it while any instance is started.
+`stop()` does not wait for the task or raise fetch failures. The task exits when no instances are started and any
+current fetch is finished. Any prices returned by that fetch are used. Fetched prices stay in use; they never revert
+to the data bundled with the package.
 
 If you'd like to wait for prices to be updated without access to the `UpdatePrices` instance, you can use the `wait_prices_updated_sync` function:
 
@@ -135,7 +247,7 @@ wait_prices_updated_sync()
 ...
 ```
 
-Or it's async variant, `wait_prices_updated_async`.
+Or its async variant, `wait_prices_updated_async`.
 
 ### CLI Usage
 
@@ -178,3 +290,33 @@ CLI output notes:
 We do not yet build API documentation for this package, but the source code is relatively simple and well documented.
 
 If you need further information on the API, we encourage you to read the source code.
+
+## Fractional usage values
+
+Every reportable usage unit accepts finite non-negative integers or fractional values. For example, duration usage can
+include fractions of a second:
+
+```python
+from decimal import Decimal
+
+from genai_prices import Usage
+
+duration = Usage(audio_seconds=0.1) + Usage(audio_seconds=0.2)
+exact_duration = Usage(audio_seconds=Decimal('0.1')) + Usage(audio_seconds=0.2)
+
+assert duration.audio_seconds == 0.3
+assert type(duration.audio_seconds) is float
+assert exact_duration.audio_seconds == Decimal('0.3')
+assert type(Usage(audio_seconds=3.0).audio_seconds) is float
+```
+
+Python preserves supplied `int`, `float`, and `Decimal` values, including `3.0` as a float. Other accepted non-boolean
+integer implementations normalize to built-in `int`. Arithmetic interprets floats through their shortest round-trippable
+decimal spellings: a result is Decimal if any operand was Decimal, otherwise float if any operand was float, otherwise
+int. This cannot recover decimal precision that was already lost before a float reached `Usage`.
+
+Standard JSON decoding normally supplies `int` and `float`, while callers may request Decimal parsing before extraction.
+Decimal-bearing usage is not serializable by Python's standard JSON encoder without a custom conversion.
+
+For Groq's Whisper models, report the transcription duration as `audio_seconds` or `input_audio_seconds`. These models
+apply Groq's documented 10-second minimum. A missing or zero duration costs zero.

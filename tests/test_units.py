@@ -303,10 +303,16 @@ def test_repo_prices_omit_redundant_equal_rate_descendants() -> None:
                         continue
 
                     closest_depth = max(len(ancestor.dimensions) for ancestor, _ in ancestor_prices)
-                    if not any(
-                        ancestor_price == price_value
+                    equal_rate_ancestors = [
+                        ancestor
                         for ancestor, ancestor_price in ancestor_prices
-                        if len(ancestor.dimensions) == closest_depth
+                        if len(ancestor.dimensions) == closest_depth and ancestor_price == price_value
+                    ]
+                    if not equal_rate_ancestors:
+                        continue
+                    if any(
+                        ancestor.dimensions.get('direction') != unit.dimensions.get('direction')
+                        for ancestor in equal_rate_ancestors
                     ):
                         continue
 
@@ -407,8 +413,10 @@ def test_unit_registry_units_mapping_is_immutable() -> None:
     [
         ('_private_name', 'private_mtok', 'must not start'),
         ('$input_tokens', 'input_mtok', 'is not a public identifier'),
-        ('class', 'class_mtok', 'is a reserved keyword'),
-        ('valid_usage', 'function', 'is a reserved keyword'),
+        ('class', 'class_mtok', 'is reserved'),
+        ('valid_usage', 'function', 'is reserved'),
+        ('range', 'range_mtok', 'is reserved'),
+        ('key', 'key_mtok', 'is reserved'),
     ],
 )
 def test_validate_units_rejects_unsafe_public_keys(usage_key: str, price_key: str, message: str) -> None:
@@ -419,6 +427,28 @@ def test_validate_units_rejects_unsafe_public_keys(usage_key: str, price_key: st
                     'per': 1_000_000,
                     'price_key': price_key,
                     'dimensions': {'family': 'tokens', 'direction': 'input'},
+                },
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ('dimension_key', 'message'),
+    [
+        (1, 'is not a public identifier'),
+        ('Å', 'is not a public identifier'),
+        ('constructor', 'is reserved'),
+        ('range', 'is reserved'),
+    ],
+)
+def test_validate_units_rejects_unsafe_dimension_keys(dimension_key: object, message: str) -> None:
+    dimensions: dict[Any, str] = {'family': 'events', dimension_key: 'value'}
+    with pytest.raises(ValueError, match=message):
+        validate_units(
+            {
+                'events': {
+                    'per': 1,
+                    'dimensions': dimensions,
                 },
             }
         )
@@ -784,6 +814,12 @@ def test_package_python_data_preserves_bundled_registry_if_runtime_provider_vali
     assert 'transient_tokens' not in bundled_registry.units
 
 
+def test_rust_package_data_rejects_colliding_constant_names() -> None:
+    unit = {'per': 1_000_000, 'dimensions': {'family': 'transient'}}
+    with pytest.raises(ValueError, match='unique when uppercased'):
+        package_data.package_rust_data([], {'foo_tokens': unit, 'FOO_tokens': unit})
+
+
 def test_runtime_provider_parsing_uses_supplied_extractor_registry() -> None:
     from genai_prices import types as runtime_types
 
@@ -1008,3 +1044,33 @@ def test_package_data_accepts_current_provider_extractor_destinations() -> None:
     registry = UnitRegistry(load_units())
 
     package_data.validate_provider_extractor_destinations(data.providers, registry)
+
+
+def test_package_data_accepts_current_provider_extractor_reasoning_coverage() -> None:
+    package_data.validate_provider_extractor_reasoning_coverage(data.providers)
+
+
+def test_package_data_extractor_validation_rejects_unmapped_reasoning_tokens() -> None:
+    provider = _build_provider_prices(
+        build_types.ModelPrice(input_mtok=Decimal('1'), output_mtok=Decimal('2')),
+        extractors=[
+            build_types.UsageExtractor.model_construct(
+                root='usage',
+                mappings=[
+                    _build_extractor_mapping('prompt_tokens', 'input_tokens'),
+                    _build_extractor_mapping('completion_tokens', 'output_tokens'),
+                ],
+                api_flavor='chat',
+                model_path='model',
+            )
+        ],
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            'Invalid extractor for testing/chat: Missing output_reasoning_tokens mapping: '
+            'extractors reading completion_tokens must also map reasoning tokens'
+        ),
+    ):
+        package_data.validate_provider_extractor_reasoning_coverage([provider])

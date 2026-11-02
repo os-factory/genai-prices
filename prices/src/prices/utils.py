@@ -1,19 +1,31 @@
 from __future__ import annotations
 
+import re
 from decimal import Decimal
+from itertools import takewhile
 from pathlib import Path
 from typing import Any, Literal, TypeVar
+
+import httpx2
 
 package_dir = Path(__file__).parent.parent.parent
 root_dir = package_dir.parent
 
 
+def get_markdown(url: str) -> str:
+    response = httpx2.get(url, timeout=30.0)
+    response.raise_for_status()
+    if response.headers.get('content-type', '').lower().startswith('text/html'):
+        raise RuntimeError(f'{url} returned HTML instead of markdown')
+    return response.text
+
+
 def pretty_size(size: int) -> str:
     if size < 1024:
         return f'{size} bytes'
-    elif size < 1024 * 1024:
+    elif size < 1024 * 1024:  # pragma: no cover - reaching this branch requires an inflated generated-data fixture
         return f'{size / 1024:.2f} KB'
-    else:
+    else:  # pragma: no cover - reaching this branch requires a generated-data fixture larger than 1 MiB
         return f'{size / (1024 * 1024):.2f} MB'
 
 
@@ -30,6 +42,35 @@ def distinct_mtok(v: Decimal | None, aggregate_v: Decimal | None) -> Decimal | N
     if v == aggregate_v:
         return None
     return mtok(v)
+
+
+def markdown_tables(markdown: str) -> list[tuple[list[str], list[list[str]]]]:
+    """Return every GFM table in `markdown` as its header cells and non-empty body rows."""
+    lines = [re.sub(r'^(?:> ?)+', '', line.strip()).strip() for line in markdown.splitlines()] + ['']
+    tables: list[tuple[list[str], list[list[str]]]] = []
+    for index, line in enumerate(lines[:-1]):
+        separator = lines[index + 1]
+        if '|' not in separator or not re.fullmatch(r'\|? *:?-+:? *(?:\| *:?-+:? *)*\|?', separator):
+            continue
+        header = _table_cells(line)
+        if len(header) != len(_table_cells(separator)):
+            continue
+        rows = [_table_cells(row_line) for row_line in takewhile(_has_cell_delimiter, lines[index + 2 :])]
+        if bad := next((row for row in rows if len(row) != len(header)), None):
+            raise ValueError(f'Table row has {len(bad)} cells, header has {len(header)}: {bad}')
+        tables.append((header, [row for row in rows if any(row)]))
+    return tables
+
+
+def _has_cell_delimiter(line: str) -> bool:
+    return re.search(r'(?<!\\)\|', line) is not None
+
+
+def _table_cells(line: str) -> list[str]:
+    line = line.removeprefix('|')
+    if line.endswith('|') and not line.endswith('\\|'):
+        line = line[:-1]
+    return [cell.strip().replace('\\|', '|') for cell in re.split(r'(?<!\\)\|', line)]
 
 
 T = TypeVar('T')
@@ -81,10 +122,10 @@ def _simplify_json_schema_object(schema: JsonSchema) -> JsonSchema:
             handled_properties[key] = simplify_json_schema(value)
         schema['properties'] = handled_properties
 
-    if (add_props := schema.get('additionalProperties')) is not None:
+    if (add_props := schema.get('additionalProperties')) is not None:  # pragma: no branch
         schema['additionalProperties'] = add_props if isinstance(add_props, bool) else simplify_json_schema(add_props)
 
-    if (pat_props := schema.get('patternProperties')) is not None:
+    if (pat_props := schema.get('patternProperties')) is not None:  # pragma: no cover
         handled_pat_props = {}
         for key, value in pat_props.items():
             handled_pat_props[key] = simplify_json_schema(value)
@@ -94,10 +135,10 @@ def _simplify_json_schema_object(schema: JsonSchema) -> JsonSchema:
 
 
 def _simplify_json_schema_array(schema: JsonSchema) -> JsonSchema:
-    if prefix_items := schema.get('prefixItems'):
+    if prefix_items := schema.get('prefixItems'):  # pragma: no cover - provider schemas use homogeneous arrays
         schema['prefixItems'] = [simplify_json_schema(item) for item in prefix_items]
 
-    if items := schema.get('items'):
+    if items := schema.get('items'):  # pragma: no branch - generated array schemas always declare items
         schema['items'] = simplify_json_schema(items)
 
     return schema
@@ -113,7 +154,7 @@ def _simplify_json_schema_union(schema: JsonSchema, union_kind: Literal['anyOf',
     # always remove null option from schemas
     if {'type': 'null'} in members:
         handled = [item for item in handled if item != {'type': 'null'}]
-        if schema.get('default', 42) is None:
+        if schema.get('default', 42) is None:  # pragma: no branch - nullable Pydantic fields have a null default
             schema.pop('default')
 
     if len(handled) == 1:

@@ -26,6 +26,125 @@ if (result) {
 }
 ```
 
+### Request pricing context
+
+```ts
+import { calcPrice } from '@pydantic/genai-prices'
+
+const price = calcPrice({ input_tokens: 1_000_000, output_tokens: 1_000_000 }, 'o3', {
+  providerId: 'openai',
+  timestamp: new Date('2026-10-12T00:00:00Z'),
+  priceContext: { service_tier: 'flex' },
+})
+if (!price || price.total_price !== 5) {
+  throw new Error('Expected the verified o3 flex price')
+}
+```
+
+You pass `priceContext` explicitly to select request-specific prices. Its keys and values are strings.
+Use the `service_tier` reported in OpenAI's response. A priority request can be downgraded and report `default`.
+`auto` is a request setting and does not identify the rate you were charged. Extraction does not infer a context.
+Tier variants are specific to their provider. If model lookup falls back to another provider, you receive the
+standard-price estimate; the fallback provider's tier rates are not applied.
+
+OpenAI variants cover `flex`, `priority`, and `fast` where the published rate table supports them.
+`default` selects standard prices on these models. Omit the context for ordinary standard pricing.
+
+If a context matches no variant, you receive the standard-price estimate.
+This includes unsupported models, unknown tiers, misspelled keys, and dates without verified tier rates.
+The bundled tier rates are verified from October 12, 2026; earlier tier history is not modeled.
+
+### Batch API
+
+```ts
+import { calcPrice } from '@pydantic/genai-prices'
+
+const price = calcPrice({ input_tokens: 1_000_000, output_tokens: 1_000_000 }, 'o3', {
+  providerId: 'openai',
+  timestamp: new Date('2026-10-14T00:00:00Z'),
+  priceContext: { processing: 'batch' },
+})
+if (!price || price.total_price !== 5) {
+  throw new Error('Expected the verified o3 batch price')
+}
+```
+
+You pass `{ processing: 'batch' }` for usage from a provider's batch API. Most providers do not mark batch results in
+the response, so you set it yourself. Batch is a separate key from `service_tier` because it is a way of submitting
+requests, not a tier: OpenAI batch results report `service_tier: "default"`.
+
+Batch rates are bundled for Anthropic, OpenAI, Google, Mistral, Groq and xAI, verified from October 14, 2026.
+A model the provider does not serve in batch returns the standard-price estimate.
+
+### Perplexity web search
+
+For `perplexity/sonar`, pass the search type used in the Perplexity request:
+
+```ts
+import { calcPrice } from '@pydantic/genai-prices'
+
+const price = calcPrice({ web_searches: 2 }, 'perplexity/sonar', {
+  providerId: 'perplexity',
+  priceContext: { search_type: 'fast' },
+})
+if (!price) {
+  throw new Error('No price found for perplexity/sonar')
+}
+console.log(price.total_price) // 0.002
+```
+
+The response reports the search count but not the search type, so extraction cannot select the rate automatically.
+Pass `search_type: fast` even when a Perplexity preset selects Fast Search. Omitting the context or passing
+`search_type: web` uses the standard estimate of $2.50 per thousand searches. The fast rate is $1 per thousand.
+The search type selects the rate independently of the request date. Token charges are calculated separately.
+See [Perplexity's web-search documentation](https://docs.perplexity.ai/docs/agent-api/tools/web-search).
+
+### Cached input tokens
+
+```ts
+import { calcPrice } from '@pydantic/genai-prices'
+
+const result = calcPrice(
+  {
+    input_tokens: 4740,
+    cache_read_tokens: 0,
+    cache_write_tokens: 4735,
+    output_tokens: 255,
+  },
+  'claude-sonnet-4-20250514',
+  { providerId: 'anthropic' }
+)
+
+if (!result) {
+  throw new Error('No price found for claude-sonnet-4-20250514')
+}
+
+console.log(result.total_price)
+```
+
+`input_tokens` is the total number of input tokens. It includes uncached tokens, cache-read tokens, and cache-write
+tokens. You also report `cache_read_tokens` and `cache_write_tokens` so that `calcPrice` can apply their separate rates.
+
+Do not pass only the uncached count as `input_tokens`. Cache tokens are partitions of the total, so their combined count
+cannot exceed `input_tokens`.
+
+### Fractional usage values
+
+Every reportable usage unit accepts finite non-negative numbers, including fractions. This is useful for duration units
+such as seconds:
+
+```ts
+const usage = { audio_seconds: 0.25 }
+JSON.stringify(usage)
+```
+
+Usage remains a plain JSON-serializable object. JavaScript uses ordinary `number` arithmetic, so compare fractional
+results with an appropriate numerical tolerance. The package guards decomposition against insignificant floating-point
+residuals, but it cannot recover decimal precision that was already lost before a value was supplied.
+
+For Groq's Whisper models, report the transcription duration as `audio_seconds` or `input_audio_seconds`. These models
+apply Groq's documented 10-second minimum. A missing or zero duration costs zero.
+
 ### `updatePrices`
 
 You can optionally use `updatePrices` to implement logic that can periodically update the data used by `calcPrice`.

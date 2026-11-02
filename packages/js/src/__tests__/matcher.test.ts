@@ -4,7 +4,8 @@ import { describe, expect, it } from 'vitest'
 import type { Provider } from '../types'
 
 import { data } from '../data'
-import { matchLogic, matchModel, matchModelWithFallback, matchProvider } from '../engine'
+import { matchLogic, matchModel, matchModelWithFallback, matchProvider, normalizeCompactDatedRef } from '../engine'
+import { calcPrice } from '../index'
 
 const actualProviders = data
 
@@ -23,11 +24,132 @@ describe('Match Logic', () => {
 })
 
 describe('Provider Matching', () => {
+  it.each([
+    ['meta', 'muse-wonder-1.0', 'muse-wonder-1.0'],
+    ['meta', 'muse-spark-1.1', 'muse-spark-1.1'],
+    ['meta', 'muse-spark-1.3', 'muse-spark-1.3'],
+    ['meta', 'muse-spark-1.3-contributor', 'muse-spark-1.3-contributor'],
+    ['mistral', 'mistral-large-4', 'mistral-large-4'],
+    ['mistral', 'mistral-large-4-0', 'mistral-large-4'],
+    ['openrouter', 'meta/muse-wonder', 'meta/muse-wonder'],
+    ['openrouter', 'meta/muse-wonder-20261012', 'meta/muse-wonder'],
+    ['openrouter', 'meta/muse-spark-1.3-20260902', 'meta/muse-spark-1.3'],
+    ['openrouter', 'meta/muse-spark-1.2-contributor-20260805', 'meta/muse-spark-1.2-contributor'],
+    ['openrouter', 'mistralai/mistral-large-4-0', 'mistralai/mistral-large-4-0'],
+    ['openrouter', 'mistralai/mistral-large-4-0-20261006', 'mistralai/mistral-large-4-0'],
+  ])('resolves %s model ref %s to %s', (providerId, modelRef, expectedModelId) => {
+    expect(calcPrice({ input_tokens: 1 }, modelRef, { providerId, timestamp: new Date('2026-10-17T00:00:00Z') })?.model.id).toBe(
+      expectedModelId
+    )
+  })
+
+  it.each([
+    // Standard: 0.9M uncached x $1.25 + 0.1M cached x $0.15 + 1M out x $4.25 + 1 search x $0.0025
+    ['meta', 'muse-spark-1.1', 5.3925],
+    ['meta', 'muse-spark-1.2', 5.3925],
+    ['meta', 'muse-spark-1.3', 5.3925],
+    // Contributor: 0.9M x $0.10 + 0.1M x $0.002 + 1M x $0.20 + 1 search x $0.0025
+    ['meta', 'muse-spark-1.2-contributor', 0.2927],
+    ['meta', 'muse-spark-1.3-contributor', 0.2927],
+    ['openrouter', 'meta/muse-spark-1.3-20260902', 5.3925],
+    ['openrouter', 'meta/muse-spark-1.3-contributor-20260902', 0.2927],
+  ])('prices %s Muse Spark model %s', (providerId, modelRef, expectedTotal) => {
+    const usage = { cache_read_tokens: 100_000, input_tokens: 1_000_000, output_tokens: 1_000_000, web_searches: 1 }
+    expect(calcPrice(usage, modelRef, { providerId, timestamp: new Date('2026-10-17T00:00:00Z') })?.total_price).toBeCloseTo(
+      expectedTotal,
+      10
+    )
+  })
+
+  it('prices the October Meta and Mistral models with their confirmed routes', () => {
+    const tokenUsage = { cache_read_tokens: 100_000, input_tokens: 1_000_000, output_tokens: 1_000_000 }
+    const meta = actualProviders.find((provider) => provider.id === 'meta')!
+    expect(matchModel(meta.models, 'muse-wonder-1.0')?.context_window).toBe(1_048_576)
+    expect(
+      calcPrice({ ...tokenUsage, web_searches: 1 }, 'muse-wonder-1.0', {
+        providerApiUrl: 'https://api.meta.ai/v1',
+        timestamp: new Date('2026-10-17T00:00:00Z'),
+      })?.total_price
+    ).toBeCloseTo(23.6225, 10)
+    expect(
+      calcPrice({ ...tokenUsage, web_searches: 1 }, 'meta/muse-wonder-20261012', {
+        providerId: 'openrouter',
+        timestamp: new Date('2026-10-17T00:00:00Z'),
+      })?.total_price
+    ).toBeCloseTo(23.6225, 10)
+
+    const mistral = actualProviders.find((provider) => provider.id === 'mistral')!
+    expect(matchModel(mistral.models, 'mistral-large-4-0')?.context_window).toBe(1_048_576)
+    expect(
+      calcPrice(tokenUsage, 'mistral-large-4-0', {
+        providerId: 'mistral',
+        timestamp: new Date('2026-10-17T00:00:00Z'),
+      })?.total_price
+    ).toBeCloseTo(2.709, 10)
+
+    const openrouter = actualProviders.find((provider) => provider.id === 'openrouter')!
+    expect(matchModel(openrouter.models, 'mistralai/mistral-large-4-0-20261006')?.context_window).toBeUndefined()
+    expect(
+      calcPrice(tokenUsage, 'mistralai/mistral-large-4-0-20261006', {
+        providerId: 'openrouter',
+        timestamp: new Date('2026-10-17T00:00:00Z'),
+      })?.total_price
+    ).toBeCloseTo(2.709, 10)
+    expect(
+      calcPrice(tokenUsage, 'mistralai/mistral-large-4-0', {
+        priceContext: { route: 'mistral/eu' },
+        providerId: 'openrouter',
+        timestamp: new Date('2026-10-17T00:00:00Z'),
+      })?.total_price
+    ).toBeCloseTo(2.9799, 10)
+  })
+
   describe('matchProvider with modelId', () => {
     it('prefers Fireworks for its fully-qualified DeepSeek model IDs', () => {
       const provider = matchProvider(actualProviders, { modelId: 'accounts/fireworks/models/deepseek-v4-flash-0731' })
 
       expect(provider?.id).toBe('fireworks')
+    })
+
+    it('preserves Mistral aliases without claiming qualified OpenRouter model IDs', () => {
+      expect(matchProvider(actualProviders, { modelId: 'open-mistral-7b' })?.id).toBe('mistral')
+      expect(matchProvider(actualProviders, { modelId: 'open-mistral-nemo' })?.id).toBe('mistral')
+      expect(matchProvider(actualProviders, { modelId: 'open-mixtral-8x7b' })?.id).toBe('mistral')
+      expect(matchProvider(actualProviders, { modelId: 'mistralai/voxtral-small-24b-2507' })).toBeUndefined()
+    })
+
+    it('infers Cursor only for its Composer namespace', () => {
+      expect(matchProvider(actualProviders, { modelId: 'composer-2.5' })?.id).toBe('cursor')
+      expect(matchProvider(actualProviders, { modelId: 'grok-4.6' })?.id).not.toBe('cursor')
+    })
+
+    it('infers Meta only for its priced model IDs and API host', () => {
+      expect(matchProvider(actualProviders, { modelId: 'muse-wonder-1.0' })?.id).toBe('meta')
+      expect(matchProvider(actualProviders, { modelId: 'muse-spark-1.3' })?.id).toBe('meta')
+      expect(matchProvider(actualProviders, { modelId: 'muse-spark-1.3-contributor' })?.id).toBe('meta')
+      // Unpriced Muse models (per-image, per-second) must not be claimed.
+      expect(matchProvider(actualProviders, { modelId: 'muse-image-1.0' })?.id).not.toBe('meta')
+      expect(matchProvider(actualProviders, { providerApiUrl: 'https://api.meta.ai/v1' })?.id).toBe('meta')
+      expect(matchProvider(actualProviders, { providerApiUrl: 'https://api.meta.ai.evil.test/v1' })?.id).not.toBe('meta')
+    })
+
+    it('does not claim third-party model namespaces for Arcee', () => {
+      expect(matchProvider(actualProviders, { modelId: 'deepseek/deepseek-v4-pro' })?.id).not.toBe('arcee')
+    })
+
+    it('does not claim third-party model namespaces for Baseten', () => {
+      expect(matchProvider(actualProviders, { modelId: 'zai-org/GLM-5.3' })?.id).not.toBe('baseten')
+    })
+
+    it('infers Databricks from its endpoint and Unity AI Gateway names only', () => {
+      expect(matchProvider(actualProviders, { modelId: 'databricks-gpt-oss-120b' })?.id).toBe('databricks')
+      expect(matchProvider(actualProviders, { modelId: 'system.ai.kimi-k3' })?.id).toBe('databricks')
+      expect(matchProvider(actualProviders, { modelId: 'kimi-k3' })?.id).toBe('moonshotai')
+    })
+
+    it('does not claim the vendor namespaces GitHub Copilot resells', () => {
+      expect(matchProvider(actualProviders, { modelId: 'claude-haiku-4.5' })?.id).toBe('anthropic')
+      expect(matchProvider(actualProviders, { modelId: 'gemini-3.6-flash' })?.id).toBe('google')
     })
   })
 
@@ -36,6 +158,11 @@ describe('Provider Matching', () => {
       expect(matchProvider(actualProviders, { providerId: 'google' })?.id).toBe('google')
       expect(matchProvider(actualProviders, { providerId: 'anthropic' })?.id).toBe('anthropic')
       expect(matchProvider(actualProviders, { providerId: 'openai' })?.id).toBe('openai')
+      expect(matchProvider(actualProviders, { providerId: 'arcee' })?.id).toBe('arcee')
+      expect(matchProvider(actualProviders, { providerId: 'baseten' })?.id).toBe('baseten')
+      expect(matchProvider(actualProviders, { providerId: 'cursor' })?.id).toBe('cursor')
+      expect(matchProvider(actualProviders, { providerId: 'databricks' })?.id).toBe('databricks')
+      expect(matchProvider(actualProviders, { providerId: 'github-copilot' })?.id).toBe('github-copilot')
     })
 
     it('should find providers by provider_match logic', () => {
@@ -44,6 +171,7 @@ describe('Provider Matching', () => {
       expect(matchProvider(actualProviders, { providerId: 'gemini' })?.id).toBe('google')
       expect(matchProvider(actualProviders, { providerId: 'mistral' })?.id).toBe('mistral')
       expect(matchProvider(actualProviders, { providerId: 'mistralai' })?.id).toBe('mistral')
+      expect(matchProvider(actualProviders, { providerId: 'copilot' })?.id).toBe('github-copilot')
       expect(matchProvider(actualProviders, { providerId: 'anthropic' })?.id).toBe('anthropic')
       expect(matchProvider(actualProviders, { providerId: 'openai' })?.id).toBe('openai')
     })
@@ -66,6 +194,89 @@ describe('Provider Matching', () => {
     it('should not match model names as providers', () => {
       expect(matchProvider(actualProviders, { providerId: 'claude' })).toBeUndefined()
       expect(matchProvider(actualProviders, { providerId: 'gpt' })).toBeUndefined()
+    })
+
+    it('prices only known Command A model IDs', () => {
+      const usage = { input_tokens: 1 }
+
+      expect(calcPrice(usage, 'command-a', { providerId: 'cohere' })?.model.id).toBe('command-a')
+      expect(calcPrice(usage, 'command-a-03-2025', { providerId: 'cohere' })?.model.id).toBe('command-a')
+      expect(calcPrice(usage, 'command-a-plus-05-2026', { providerId: 'cohere' })).toBeNull()
+    })
+  })
+
+  describe('matchProvider with providerApiUrl', () => {
+    // Every `api_pattern` is unanchored, so matching must be anchored at the start of the URL — as
+    // Python's `re.match` is. Otherwise a proxy URL carrying a provider host resolves to that provider
+    // in JS while raising `LookupError` in Python.
+    const proxiedOpenaiApiUrl = 'http://localhost:8080/proxy?u=https://api.openai.com/v1'
+
+    it('should match a provider at the start of the URL', () => {
+      expect(matchProvider(actualProviders, { providerApiUrl: 'https://api.openai.com/v1/chat/completions' })?.id).toBe('openai')
+      expect(matchProvider(actualProviders, { providerApiUrl: 'https://api.arcee.ai/api/v1/chat/completions' })?.id).toBe('arcee')
+      expect(matchProvider(actualProviders, { providerApiUrl: 'https://inference.baseten.co/v1/chat/completions' })?.id).toBe('baseten')
+      expect(matchProvider(actualProviders, { providerApiUrl: 'https://api.cursor.com/v1/agents' })?.id).toBe('cursor')
+      expect(matchProvider(actualProviders, { providerApiUrl: 'https://api.githubcopilot.com/chat/completions' })?.id).toBe(
+        'github-copilot'
+      )
+    })
+
+    it('keeps shared OpenAI URLs on OpenAI and selects Decisions by normalized provider ID', () => {
+      for (const providerApiUrl of [
+        'https://api.openai.com/v1/',
+        'https://api.openai.com/v1/chat/completions',
+        'https://api.openai.com/v1/responses',
+        'https://api.openai.com/v1/decisions',
+      ]) {
+        expect(matchProvider(actualProviders, { providerApiUrl })?.id).toBe('openai')
+      }
+
+      const price = calcPrice({ cache_read_tokens: 200, input_tokens: 1_000, output_tokens: 100 }, 'gpt-6-luna', {
+        providerId: ' OPENAI-DECISIONS ',
+        timestamp: new Date('2026-10-18T00:00:00Z'),
+      })
+      expect(price?.provider.id).toBe('openai-decisions')
+      expect(price?.total_price).toBeCloseTo(0.0001, 10)
+      expect(calcPrice({ input_tokens: 1 }, 'gpt-6-sol', { providerId: 'openai-decisions' })).toBeNull()
+
+      const inferredPrice = calcPrice({ cache_read_tokens: 200, input_tokens: 1_000, output_tokens: 100 }, 'gpt-6-luna', {
+        timestamp: new Date('2026-10-18T00:00:00Z'),
+      })
+      expect(inferredPrice?.provider.id).toBe('openai')
+      expect(inferredPrice?.total_price).toBeCloseTo(0.000132, 10)
+
+      for (const { expectedTotal, inputTokens } of [
+        { expectedTotal: 0.0272, inputTokens: 272_000 },
+        { expectedTotal: 0.0544002, inputTokens: 272_001 },
+      ]) {
+        const tierPrice = calcPrice({ cache_read_tokens: 100_000, cache_write_tokens: 50_000, input_tokens: inputTokens }, 'gpt-6-luna', {
+          providerId: 'openai-decisions',
+          timestamp: new Date('2026-10-18T00:00:00Z'),
+        })
+        expect(tierPrice?.total_price).toBeCloseTo(expectedTotal, 10)
+      }
+    })
+
+    it.each([
+      'https://my-workspace.cloud.databricks.com/serving-endpoints/chat/completions',
+      'https://adb-1234567890123456.7.azuredatabricks.net/serving-endpoints/databricks-gpt-oss-120b/invocations',
+      'https://1234567890123456.7.gcp.databricks.com/ai-gateway/mlflow/v1/chat/completions',
+    ])('should match the Databricks workspace endpoint %s', (providerApiUrl) => {
+      expect(matchProvider(actualProviders, { providerApiUrl })?.id).toBe('databricks')
+    })
+
+    it.each([
+      'https://my-workspace.cloud.databricks.com.evil.test/serving-endpoints/chat/completions',
+      'https://adb-1234567890123456.7.azuredatabricks.net.evil.test/serving-endpoints/databricks-gpt-oss-120b/invocations',
+      'https://1234567890123456.7.gcp.databricks.com.evil.test/ai-gateway/mlflow/v1/chat/completions',
+      'https://my-workspace.cloud.databricks.com/api/2.0/clusters/list',
+    ])('should not match Databricks for %s', (providerApiUrl) => {
+      expect(matchProvider(actualProviders, { providerApiUrl })).toBeUndefined()
+    })
+
+    it('should not match a provider embedded later in the URL', () => {
+      expect(matchProvider(actualProviders, { providerApiUrl: proxiedOpenaiApiUrl })).toBeUndefined()
+      expect(calcPrice({ input_tokens: 1_000 }, 'gpt-4o', { providerApiUrl: proxiedOpenaiApiUrl })).toBeNull()
     })
   })
 })
@@ -94,6 +305,35 @@ describe('Model Matching with Fallback', () => {
       const model = matchModelWithFallback(azure!, 'gpt-4.1', actualProviders)
       expect(model).toBeDefined()
       expect(model?.id).toBe('gpt-4.1')
+    })
+
+    it('should resolve compact dated refs to the dashed alias', () => {
+      const openai = matchProvider(actualProviders, { providerId: 'openai' })
+      expect(openai).toBeDefined()
+
+      // LiteLLM/OpenRouter emit `gpt-5.2-20251211`, only the dashed form is aliased
+      const compact = matchModelWithFallback(openai!, 'gpt-5.2-20251211', actualProviders)
+      expect(compact?.id).toBe('gpt-5.2')
+      const dashed = matchModelWithFallback(openai!, 'gpt-5.2-2025-12-11', actualProviders)
+      expect(dashed?.id).toBe('gpt-5.2')
+    })
+
+    it('should not normalize refs that match on the compact date form', () => {
+      // Bedrock models match the compact date via `contains`, so they must be returned as-is
+      const aws = matchProvider(actualProviders, { providerId: 'aws' })
+      expect(aws).toBeDefined()
+      const model = matchModelWithFallback(aws!, 'claude-3-5-haiku-20241022', actualProviders)
+      expect(model?.id).toBe('regional.anthropic.claude-3-5-haiku-20241022-v1:0')
+    })
+
+    it('should only normalize valid compact dates', () => {
+      expect(normalizeCompactDatedRef('gpt-5.2-20251211')).toBe('gpt-5.2-2025-12-11')
+      expect(normalizeCompactDatedRef('claude-3-5-haiku-20241022')).toBe('claude-3-5-haiku-2024-10-22')
+      expect(normalizeCompactDatedRef('model-20240229')).toBe('model-2024-02-29')
+      // suffixes that aren't valid calendar dates are left untouched
+      expect(normalizeCompactDatedRef('gpt-4o-12345678')).toBe('gpt-4o-12345678')
+      expect(normalizeCompactDatedRef('gpt-4o-20251301')).toBe('gpt-4o-20251301')
+      expect(normalizeCompactDatedRef('gpt-4o-20250230')).toBe('gpt-4o-20250230')
     })
 
     it('should fallback to other providers when model not found directly', () => {
@@ -179,6 +419,31 @@ describe('Model Matching with Fallback', () => {
       expect(model?.id).toBe('shared-model-main')
     })
 
+    it('should prioritize an exact fallback match over a normalized fallback match', () => {
+      const normalizedProvider: Provider = {
+        api_pattern: 'normalized.example.com',
+        id: 'normalized-provider',
+        models: [{ id: 'normalized-model', match: { equals: 'model-2025-02-28' }, prices: {} }],
+        name: 'Normalized Provider',
+      }
+      const exactProvider: Provider = {
+        api_pattern: 'exact.example.com',
+        id: 'exact-provider',
+        models: [{ id: 'exact-model', match: { equals: 'model-20250228' }, prices: {} }],
+        name: 'Exact Provider',
+      }
+      const mainProvider: Provider = {
+        api_pattern: 'main.example.com',
+        fallback_model_providers: ['normalized-provider', 'exact-provider'],
+        id: 'main-provider',
+        models: [],
+        name: 'Main Provider',
+      }
+
+      const model = matchModelWithFallback(mainProvider, 'model-20250228', [mainProvider, normalizedProvider, exactProvider])
+      expect(model?.id).toBe('exact-model')
+    })
+
     it('should support chained fallbacks', () => {
       const secondProvider: Provider = {
         api_pattern: 'second.example.com',
@@ -229,5 +494,320 @@ describe('Model Matching with Fallback', () => {
       expect(fallbackMatch).toBeDefined()
       expect(fallbackMatch?.id).toBe(openaiModel?.id)
     })
+
+    it('should work with real data - Azure AI Foundry marketplace models fall back to the origin provider', () => {
+      const azure = matchProvider(actualProviders, { providerId: 'azure' })
+      expect(azure).toBeDefined()
+      if (!azure) return
+      expect(azure.fallback_model_providers).toEqual(['openai', 'anthropic', 'deepseek', 'x-ai', 'moonshotai'])
+
+      for (const [modelRef, expectedId] of [
+        ['Kimi-K2.6-1', 'kimi-k2.6'],
+        ['grok-4.3', 'grok-4.3'],
+        ['DeepSeek-V4-Pro', 'deepseek-v4-pro'],
+      ] as const) {
+        expect(matchModel(azure.models, modelRef)).not.toBeDefined()
+        expect(matchModelWithFallback(azure, modelRef, actualProviders)?.id).toBe(expectedId)
+      }
+    })
+  })
+})
+
+describe('Gemini family aliases', () => {
+  // Each alias follows the model the Gemini API's `modelVersion` reports for it.
+  it.each([
+    ['gemini-flash-latest', 'gemini-3.8-flash'],
+    ['gemini-flash-lite-latest', 'gemini-3.5-flash-lite'],
+    ['gemini-pro-latest', 'gemini-3.1-pro-preview'],
+  ])('resolves %s to %s', (modelRef, modelId) => {
+    expect(calcPrice({ input_tokens: 1 }, modelRef, { providerId: 'google' })!.model.id).toBe(modelId)
+  })
+})
+
+describe('Claude Fable 5 vs 5.1', () => {
+  // Fable 5.1 caches reads at 0.025x base input; Fable 5 at the usual 0.1x. The Fable 5
+  // records match by prefix, so a loose clause silently prices Fable 5.1 cache reads 4x
+  // too high instead of failing.
+  const usage = { cache_read_tokens: 1_000_000, input_tokens: 1_000_000 }
+
+  it.each([
+    ['anthropic', 'claude-fable-5', 'claude-fable-5-1'],
+    ['anthropic', 'claude-fable-5-20260901', 'claude-fable-5-1-20260901'],
+    ['google', 'claude-fable-5', 'claude-fable-5-1'],
+    ['google', 'claude-fable-5@20260901', 'claude-fable-5-1@20260901'],
+    ['aws', 'global.anthropic.claude-fable-5-v1:0', 'global.anthropic.claude-fable-5-1-v1:0'],
+    ['aws', 'us.anthropic.claude-fable-5-v1:0', 'us.anthropic.claude-fable-5-1-v1:0'],
+    ['openrouter', 'anthropic/claude-fable-5', 'anthropic/claude-fable-5.1'],
+  ])('keeps %s Fable 5.1 off Fable 5 prices', (providerId, fable5Ref, fable51Ref) => {
+    const fable5 = calcPrice(usage, fable5Ref, { providerId, timestamp: new Date('2026-10-17T00:00:00Z') })
+    const fable51 = calcPrice(usage, fable51Ref, { providerId, timestamp: new Date('2026-10-17T00:00:00Z') })
+
+    expect(fable51!.model.id).not.toBe(fable5!.model.id)
+    expect(fable51!.total_price).toBeCloseTo(fable5!.total_price / 4, 10)
+  })
+
+  it.each([
+    ['anthropic', 'claude-fable-5-1', 0.25],
+    ['anthropic', 'claude-fable-5-1-20260901', 0.25],
+    ['google', 'claude-fable-5-1', 0.25],
+    ['google', 'claude-fable-5-1@20260901', 0.25],
+    ['aws', 'global.anthropic.claude-fable-5-1-v1:0', 0.25],
+    ['aws', 'us.anthropic.claude-fable-5-1-v1:0', 0.275],
+    ['openrouter', 'anthropic/claude-fable-5.1', 0.25],
+  ])('prices %s %s cache reads at the 0.025x rate', (providerId, modelRef, expected) => {
+    expect(calcPrice(usage, modelRef, { providerId, timestamp: new Date('2026-10-17T00:00:00Z') })!.total_price).toBeCloseTo(expected, 10)
+  })
+
+  // Bedrock's Fable inference profile ids carry no `-v1:0` suffix; geographic ones take the regional rate.
+  it.each([
+    ['us.anthropic.claude-fable-5', 'regional.anthropic.claude-fable-5-v1:0', 80.85],
+    ['eu.anthropic.claude-fable-5', 'regional.anthropic.claude-fable-5-v1:0', 80.85],
+    ['au.anthropic.claude-fable-5', 'regional.anthropic.claude-fable-5-v1:0', 80.85],
+    ['us.anthropic.claude-fable-5-v1:0', 'regional.anthropic.claude-fable-5-v1:0', 80.85],
+    ['anthropic.claude-fable-5', 'regional.anthropic.claude-fable-5-v1:0', 80.85],
+    ['global.anthropic.claude-fable-5', 'global.anthropic.claude-fable-5-v1:0', 73.5],
+    ['global.anthropic.claude-fable-5-v1:0', 'global.anthropic.claude-fable-5-v1:0', 73.5],
+    ['us.anthropic.claude-fable-5-1', 'regional.anthropic.claude-fable-5-1-v1:0', 80.025],
+    ['us.anthropic.claude-fable-5-1-v1:0', 'regional.anthropic.claude-fable-5-1-v1:0', 80.025],
+    ['anthropic.claude-fable-5-1', 'regional.anthropic.claude-fable-5-1-v1:0', 80.025],
+    ['global.anthropic.claude-fable-5-1', 'global.anthropic.claude-fable-5-1-v1:0', 72.75],
+    ['global.anthropic.claude-fable-5-1-v1:0', 'global.anthropic.claude-fable-5-1-v1:0', 72.75],
+  ])('prices the AWS id %s as %s', (modelRef, modelId, expected) => {
+    const price = calcPrice(
+      { cache_read_tokens: 1_000_000, cache_write_tokens: 1_000_000, input_tokens: 3_000_000, output_tokens: 1_000_000 },
+      modelRef,
+      { providerId: 'aws', timestamp: new Date('2026-10-17T00:00:00Z') }
+    )
+
+    expect(price!.model.id).toBe(modelId)
+    expect(price!.total_price).toBeCloseTo(expected, 10)
+  })
+
+  it('leaves the OpenRouter family-level alias on Fable 5', () => {
+    const price = calcPrice(usage, '~anthropic/claude-fable-latest', {
+      providerId: 'openrouter',
+      timestamp: new Date('2026-10-17T00:00:00Z'),
+    })
+
+    expect(price!.total_price).toBeCloseTo(1, 10)
+  })
+})
+
+describe('Claude Opus 5 vs 5.5', () => {
+  // Opus 5.5 caches reads at 0.05x of a $4 base input; Opus 5 at 0.1x of $5. The Opus 5 records
+  // matched by prefix, so `claude-opus-5-5` silently resolved to Opus 5 and was priced 2.5x too
+  // high on cache reads instead of failing.
+  const usage = { cache_read_tokens: 1_000_000, input_tokens: 1_000_000 }
+
+  it.each([
+    ['anthropic', 'claude-opus-5', 'claude-opus-5-5'],
+    ['anthropic', 'claude-opus-5-20260901', 'claude-opus-5-5-20260922'],
+    ['google', 'claude-opus-5', 'claude-opus-5-5'],
+    ['google', 'claude-opus-5@20260901', 'claude-opus-5-5@20260922'],
+    ['google', 'publishers/anthropic/models/claude-opus-5', 'publishers/anthropic/models/claude-opus-5-5'],
+    ['aws', 'global.anthropic.claude-opus-5', 'global.anthropic.claude-opus-5-5'],
+    ['aws', 'global.anthropic.claude-opus-5-v1:0', 'global.anthropic.claude-opus-5-5-v1:0'],
+    ['aws', 'us.anthropic.claude-opus-5', 'us.anthropic.claude-opus-5-5'],
+    ['aws', 'us.anthropic.claude-opus-5-v1:0', 'us.anthropic.claude-opus-5-5-v1:0'],
+    ['aws', 'anthropic.claude-opus-5', 'anthropic.claude-opus-5-5'],
+    ['openrouter', 'anthropic/claude-opus-5', 'anthropic/claude-opus-5.5'],
+  ])('keeps %s Opus 5.5 off Opus 5 prices', (providerId, opus5Ref, opus55Ref) => {
+    const opus5 = calcPrice(usage, opus5Ref, { providerId, timestamp: new Date('2026-10-17T00:00:00Z') })
+    const opus55 = calcPrice(usage, opus55Ref, { providerId, timestamp: new Date('2026-10-17T00:00:00Z') })
+
+    expect(opus55!.model.id).not.toBe(opus5!.model.id)
+    expect(opus55!.total_price * 2.5).toBeCloseTo(opus5!.total_price, 10)
+  })
+
+  it.each([
+    ['anthropic', 'claude-opus-5-5', 24.2],
+    ['google', 'claude-opus-5-5', 24.2],
+    ['aws', 'global.anthropic.claude-opus-5-5', 24.2],
+    ['aws', 'us.anthropic.claude-opus-5-5', 26.62],
+    ['aws', 'eu.anthropic.claude-opus-5-5', 26.62],
+    ['aws', 'au.anthropic.claude-opus-5-5', 26.62],
+    ['aws', 'jp.anthropic.claude-opus-5-5', 26.62],
+    ['aws', 'anthropic.claude-opus-5-5', 26.62],
+    ['openrouter', 'anthropic/claude-opus-5.5', 24.2],
+  ])('prices %s %s at the Opus 5.5 rates', (providerId, modelRef, expected) => {
+    const price = calcPrice({ cache_read_tokens: 1_000_000, input_tokens: 2_000_000, output_tokens: 1_000_000 }, modelRef, {
+      providerId,
+      timestamp: new Date('2026-10-17T00:00:00Z'),
+    })
+
+    expect(price!.total_price).toBeCloseTo(expected, 10)
+  })
+
+  it.each([
+    ['anthropic', 'claude-opus-5-20260901', 'claude-opus-5'],
+    ['anthropic', 'claude-opus-5@20260901', 'claude-opus-5'],
+    ['anthropic', 'claude-opus-5-2026-09-01', 'claude-opus-5'],
+    ['anthropic', 'claude-opus-5-latest', 'claude-opus-5'],
+    ['google', 'claude-opus-5@20260901', 'claude-opus-5'],
+    ['aws', 'global.anthropic.claude-opus-5-v1:0', 'global.anthropic.claude-opus-5'],
+    ['aws', 'us.anthropic.claude-opus-5-v1:0', 'regional.anthropic.claude-opus-5'],
+  ])('keeps the %s Opus 5 form %s on Opus 5', (providerId, modelRef, modelId) => {
+    expect(calcPrice(usage, modelRef, { providerId })!.model.id).toBe(modelId)
+  })
+
+  it.each([
+    ['2026-09-21T23:59:00Z', 25.5],
+    ['2026-09-22T00:00:00Z', 20.2],
+  ])('moves the OpenRouter family-level alias to Opus 5.5 at %s', (timestamp, expected) => {
+    const price = calcPrice({ ...usage, output_tokens: 1_000_000 }, '~anthropic/claude-opus-latest', {
+      providerId: 'openrouter',
+      timestamp: new Date(timestamp),
+    })
+
+    expect(price!.total_price).toBeCloseTo(expected, 10)
+  })
+})
+
+describe('Claude Sonnet 5 vs 5.5', () => {
+  // Sonnet 5.5 resolves to its own model, and bills cache reads at half Sonnet 5's rate (0.05x input).
+  const usage = { input_tokens: 1_000_000, output_tokens: 1_000_000 }
+  const withCacheReads = { cache_read_tokens: 1_000_000, input_tokens: 2_000_000, output_tokens: 1_000_000 }
+
+  it.each([
+    ['anthropic', 'claude-sonnet-5-5', 'claude-sonnet-5-5', 12.1],
+    ['anthropic', 'claude-sonnet-5-5-20260928', 'claude-sonnet-5-5', 12.1],
+    ['google', 'claude-sonnet-5-5', 'claude-sonnet-5-5', 12.1],
+    ['google', 'claude-sonnet-5-5@20260928', 'claude-sonnet-5-5', 12.1],
+    ['google', 'publishers/anthropic/models/claude-sonnet-5-5', 'claude-sonnet-5-5', 12.1],
+    ['aws', 'global.anthropic.claude-sonnet-5-5', 'global.anthropic.claude-sonnet-5-5', 12.1],
+    ['aws', 'global.anthropic.claude-sonnet-5-5-v1:0', 'global.anthropic.claude-sonnet-5-5', 12.1],
+    ['aws', 'us.anthropic.claude-sonnet-5-5', 'regional.anthropic.claude-sonnet-5-5', 13.31],
+    ['aws', 'us.anthropic.claude-sonnet-5-5-v1:0', 'regional.anthropic.claude-sonnet-5-5', 13.31],
+    ['aws', 'anthropic.claude-sonnet-5-5', 'regional.anthropic.claude-sonnet-5-5', 13.31],
+    ['openrouter', 'anthropic/claude-sonnet-5.5', 'anthropic/claude-sonnet-5.5', 12.1],
+  ])('resolves %s %s to %s', (providerId, modelRef, modelId, expected) => {
+    const price = calcPrice(withCacheReads, modelRef, { providerId, timestamp: new Date('2026-10-17T00:00:00Z') })
+
+    expect(price!.model.id).toBe(modelId)
+    expect(price!.total_price).toBeCloseTo(expected, 10)
+  })
+
+  it.each([
+    ['anthropic', 'claude-sonnet-5', 'claude-sonnet-5'],
+    ['anthropic', 'claude-sonnet-5-20260630', 'claude-sonnet-5'],
+    ['google', 'claude-sonnet-5@20260630', 'claude-sonnet-5'],
+    ['aws', 'global.anthropic.claude-sonnet-5', 'global.anthropic.claude-sonnet-5-v1:0'],
+    ['aws', 'global.anthropic.claude-sonnet-5-v1:0', 'global.anthropic.claude-sonnet-5-v1:0'],
+    ['aws', 'us.anthropic.claude-sonnet-5-v1:0', 'regional.anthropic.claude-sonnet-5-v1:0'],
+    ['aws', 'anthropic.claude-sonnet-5', 'regional.anthropic.claude-sonnet-5-v1:0'],
+  ])('keeps the %s Sonnet 5 form %s on Sonnet 5', (providerId, modelRef, modelId) => {
+    expect(calcPrice(usage, modelRef, { providerId })!.model.id).toBe(modelId)
+  })
+
+  it.each([
+    ['2026-09-27T23:59:00Z', 18],
+    ['2026-09-28T00:00:00Z', 12],
+  ])('moves the OpenRouter family-level alias to Sonnet 5.5 at %s', (timestamp, expected) => {
+    const price = calcPrice(usage, '~anthropic/claude-sonnet-latest', {
+      providerId: 'openrouter',
+      timestamp: new Date(timestamp),
+    })
+
+    expect(price!.total_price).toBeCloseTo(expected, 10)
+  })
+})
+
+describe('Claude Haiku 5.5', () => {
+  // Haiku 5.5 bills every token at 5x once the prompt exceeds 100,000 tokens; exactly 100,000 stays on the
+  // base rate and 100,001 does not.
+  const base = { input_tokens: 100_000, output_tokens: 100_000 }
+  const longContext = { input_tokens: 100_001, output_tokens: 100_000 }
+  const million = { input_tokens: 1_000_000, output_tokens: 1_000_000 }
+
+  it.each([
+    ['anthropic', 'claude-haiku-5-5', 'claude-haiku-5-5', 0.06, 0.3000005],
+    ['anthropic', 'claude-haiku-5-5-20261007', 'claude-haiku-5-5', 0.06, 0.3000005],
+    ['google', 'claude-haiku-5-5', 'claude-haiku-5-5', 0.06, 0.3000005],
+    ['google', 'claude-haiku-5-5@20261007', 'claude-haiku-5-5', 0.06, 0.3000005],
+    ['google', 'publishers/anthropic/models/claude-haiku-5-5', 'claude-haiku-5-5', 0.06, 0.3000005],
+    ['aws', 'global.anthropic.claude-haiku-5-5', 'global.anthropic.claude-haiku-5-5', 0.06, 0.3000005],
+    ['aws', 'global.anthropic.claude-haiku-5-5-v1:0', 'global.anthropic.claude-haiku-5-5', 0.06, 0.3000005],
+    ['aws', 'us.anthropic.claude-haiku-5-5', 'regional.anthropic.claude-haiku-5-5', 0.066, 0.33000055],
+    ['aws', 'eu.anthropic.claude-haiku-5-5-v1:0', 'regional.anthropic.claude-haiku-5-5', 0.066, 0.33000055],
+    ['aws', 'anthropic.claude-haiku-5-5', 'regional.anthropic.claude-haiku-5-5', 0.066, 0.33000055],
+    ['openrouter', 'anthropic/claude-haiku-5.5', 'anthropic/claude-haiku-5.5', 0.06, 0.3000005],
+    ['openrouter', 'anthropic/claude-haiku-5.5-20261007', 'anthropic/claude-haiku-5.5', 0.06, 0.3000005],
+    ['openrouter', 'anthropic/claude-haiku-5.5:batch', 'anthropic/claude-haiku-5.5:batch', 0.03, 0.15000025],
+  ])('prices %s %s as %s by prompt length', (providerId, modelRef, modelId, basePrice, longContextPrice) => {
+    const price = calcPrice(base, modelRef, { providerId, timestamp: new Date('2026-10-17T00:00:00Z') })
+
+    expect(price!.model.id).toBe(modelId)
+    expect(price!.total_price).toBeCloseTo(basePrice, 10)
+    expect(calcPrice(longContext, modelRef, { providerId, timestamp: new Date('2026-10-17T00:00:00Z') })!.total_price).toBeCloseTo(
+      longContextPrice,
+      10
+    )
+  })
+
+  it.each([
+    ['anthropic/claude-haiku-5.5', 0.02, 0.100001],
+    ['anthropic/claude-haiku-5.5-20261007', 0.02, 0.100001],
+    ['anthropic/claude-haiku-5.5:batch', 0.01, 0.0500005],
+    ['~anthropic/claude-haiku-latest', 0.02, 0.100001],
+  ])('prices one-hour cache writes for %s', (modelRef, basePrice, longContextPrice) => {
+    for (const [tokens, expected] of [
+      [100_000, basePrice],
+      [100_001, longContextPrice],
+    ] as const) {
+      const price = calcPrice({ cache_write_1h_tokens: tokens, cache_write_tokens: tokens, input_tokens: tokens }, modelRef, {
+        providerId: 'openrouter',
+        timestamp: new Date('2026-10-07T00:00:00Z'),
+      })
+
+      expect(price!.total_price).toBeCloseTo(expected, 10)
+    }
+  })
+
+  it.each([
+    ['2026-10-06T23:59:00Z', 6],
+    ['2026-10-07T00:00:00Z', 3],
+  ])('moves the OpenRouter family-level alias to Haiku 5.5 at %s', (timestamp, expected) => {
+    const price = calcPrice(million, '~anthropic/claude-haiku-latest', {
+      providerId: 'openrouter',
+      timestamp: new Date(timestamp),
+    })
+
+    expect(price!.total_price).toBeCloseTo(expected, 10)
+  })
+})
+
+describe('ElevenLabs Realtime', () => {
+  const usage = { audio_seconds: 60, cache_read_tokens: 500_000, input_tokens: 1_000_000, output_tokens: 1_000_000 }
+  const timestamp = new Date('2026-10-22T00:00:00Z')
+
+  it.each([
+    ['eleven_realtime_v1_max', 10.07],
+    ['eleven_realtime_v1_mini', 6.28],
+    ['ELEVEN_REALTIME_V1_MAX', 10.07],
+  ])('prices %s by provider ID, API URL and model namespace', (model, expectedTotal) => {
+    for (const options of [
+      { providerId: 'elevenlabs' },
+      { providerApiUrl: 'https://api.elevenlabs.io' },
+      { providerApiUrl: 'https://api.us.elevenlabs.io/v1/convai' },
+      { providerApiUrl: 'https://api.eu.residency.elevenlabs.io/v1/convai' },
+      { providerApiUrl: 'https://api.in.residency.elevenlabs.io/v1/convai' },
+      { providerApiUrl: 'https://api.sg.residency.elevenlabs.io/v1/convai' },
+      {},
+    ]) {
+      const result = calcPrice(usage, model, { ...options, timestamp })
+      expect(result?.provider.id).toBe('elevenlabs')
+      expect(result?.total_price).toBeCloseTo(expectedTotal, 10)
+    }
+  })
+
+  it.each(['https://api.elevenlabs.io.evil.example/v1', 'https://api.elevenlabs.ioevil.example/v1'])(
+    'rejects the spoofed API URL %s',
+    (providerApiUrl) => {
+      expect(calcPrice({ input_tokens: 1 }, 'eleven_realtime_v1_max', { providerApiUrl, timestamp })).toBeNull()
+    }
+  )
+
+  it('does not price other models in its namespace', () => {
+    expect(calcPrice({ input_tokens: 1 }, 'eleven_multilingual_v2', { providerId: 'elevenlabs', timestamp })).toBeNull()
   })
 })

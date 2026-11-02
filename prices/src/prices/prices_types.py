@@ -32,6 +32,7 @@ class _Model(BaseModel, extra='forbid', use_attribute_docstrings=True):
 
 
 IdField = Annotated[str, MaxLen(100), Field(pattern=r'^\S+$')]
+ModelRefField = Annotated[str, MaxLen(201), Field(pattern=r'^\S+/\S+$')]
 NameField = Annotated[str, MaxLen(100)]
 DescriptionField = Annotated[str, MaxLen(1000)]
 
@@ -105,7 +106,7 @@ class Provider(_Model):
             for expected_index, expected_id in enumerate(sorted_ids):
                 if current_id == expected_id and current_index != expected_index:
                     msg = f'Models are not sorted by ID: move `{current_id}` {current_index} -> {expected_index}'
-                    if expected_index > 0:
+                    if expected_index > 0:  # pragma: no branch - the first mismatch cannot move to index zero
                         msg += f' after `{sorted_ids[expected_index - 1]}`'
                     raise ValueError(msg)
 
@@ -178,6 +179,13 @@ class ModelInfo(_Model):
     """Description of the model"""
     match: MatchLogic
     """Boolean logic for matching this model to any identifier which could be used to reference the model in API requests"""
+    canonical_model: ModelRefField | None = Field(default=None, exclude=True)
+    """The `provider/model` record for the same underlying model, e.g. `anthropic/claude-sonnet-4-5`.
+
+    The build copies missing metadata (currently only `context_window`) from that record; an explicit
+    value on this record wins. Only set this when the value holds for every model this record matches.
+    Not included in published data.
+    """
     context_window: int | None = None
     """Maximum number of input tokens allowed for this model"""
     price_comments: DescriptionField | None = None
@@ -190,6 +198,8 @@ class ModelInfo(_Model):
 
     If no conditional models match the conditions, the first one is used.
     """
+    price_variants: list[PriceVariant] | None = None
+    """Partial request-specific prices, resolved first to last for each price key."""
     price_discrepancies: dict[str, Any] | None = Field(default=None, exclude=True)
     """List of price discrepancies based on external sources."""
     prices_checked: date | None = Field(default=None, exclude=True)
@@ -274,7 +284,7 @@ class ModelPrice(_Model):
             if getattr(self, field_name):
                 return False
         for value in (self.model_extra or {}).values():
-            if value is not None:
+            if value is not None:  # pragma: no branch - validated extra prices cannot be null
                 return False
         return True
 
@@ -322,6 +332,14 @@ class ConditionalPrice(_Model):
     """Timestamp when this price starts, None means this price is always valid."""
     prices: ModelPrice
     """Prices for this condition."""
+
+
+class PriceVariant(_Model):
+    """Partial prices selected by exact request context values."""
+
+    when: dict[str, str] = Field(min_length=1, strict=True)
+    prices: ModelPrice
+    constraint: StartDateConstraint | TimeOfDateConstraint | None = None
 
 
 class StartDateConstraint(_Model):

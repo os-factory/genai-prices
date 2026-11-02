@@ -1,4 +1,5 @@
 import re
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -21,6 +22,306 @@ from genai_prices.units import UnitRegistry
 
 class MyMapping(dict[str, Any]):
     pass
+
+
+def test_cursor_usage_event():
+    response_data = {
+        'model': 'grok-4.6-fast',
+        'tokenUsage': {
+            'inputTokens': 100,
+            'cacheWriteTokens': 20,
+            'cacheReadTokens': 30,
+            'outputTokens': 40,
+            'totalCents': 0.099,
+        },
+    }
+
+    extracted = extract_usage(response_data, provider_id='cursor', api_flavor='usage-event')
+
+    assert extracted.model is not None
+    assert extracted.model.id == 'grok-4.6-fast'
+    assert extracted.usage == Usage(
+        input_tokens=150,
+        cache_write_tokens=20,
+        cache_read_tokens=30,
+        output_tokens=40,
+    )
+    assert extracted.calc_price().total_price == Decimal('0.00099')
+
+
+def test_github_copilot_chat_usage() -> None:
+    # Recorded from POST https://api.githubcopilot.com/chat/completions on 2026-09-03.
+    response_data = {
+        'model': 'claude-haiku-4.5',
+        'usage': {
+            'completion_tokens': 8,
+            'prompt_tokens': 15,
+            'prompt_tokens_details': {'cached_tokens': 4},
+            'total_tokens': 23,
+        },
+    }
+
+    extracted = extract_usage(response_data, provider_id='github-copilot', api_flavor='chat')
+
+    assert extracted.model is not None
+    assert extracted.model.id == 'claude-haiku-4.5'
+    assert extracted.usage == Usage(input_tokens=15, cache_read_tokens=4, output_tokens=8)
+    assert extracted.calc_price(genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC)).total_price == Decimal(
+        '0.0000514'
+    )
+
+
+def test_github_copilot_responses_usage() -> None:
+    # Recorded from POST https://api.githubcopilot.com/responses on 2026-09-03, which answers a
+    # `gpt-5.4` request with the dated snapshot ID.
+    response_data = {
+        'model': 'gpt-5.4-2026-03-05',
+        'object': 'response',
+        'usage': {
+            'input_tokens': 7,
+            'input_tokens_details': {'cache_write_tokens': 2, 'cached_tokens': 3},
+            'output_tokens': 11,
+            'output_tokens_details': {'reasoning_tokens': 4},
+            'total_tokens': 18,
+        },
+    }
+
+    extracted = extract_usage(response_data, provider_id='github-copilot', api_flavor='responses')
+
+    assert extracted.model is not None
+    assert extracted.model.id == 'gpt-5.4'
+    assert extracted.usage == Usage(
+        input_tokens=7,
+        cache_read_tokens=3,
+        cache_write_tokens=2,
+        output_tokens=11,
+        output_reasoning_tokens=4,
+    )
+    assert extracted.calc_price(genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC)).total_price == Decimal(
+        '0.00017575'
+    )
+
+
+@pytest.mark.parametrize('api_flavor', ['default', 'chat'])
+def test_arcee_chat_usage(api_flavor: str) -> None:
+    response_data = {
+        'model': 'deepseek/deepseek-v4-flash-latest',
+        'usage': {
+            'prompt_tokens': 100,
+            'prompt_tokens_details': {'cached_tokens': 30},
+            'completion_tokens': 40,
+            'completion_tokens_details': {'reasoning_tokens': 10},
+        },
+    }
+
+    extracted = extract_usage(response_data, provider_id='arcee', api_flavor=api_flavor)
+
+    assert extracted.model is not None
+    assert extracted.model.id == 'deepseek/deepseek-v4-flash-latest'
+    assert extracted.usage == Usage(
+        input_tokens=100, cache_read_tokens=30, output_tokens=40, output_reasoning_tokens=10
+    )
+
+
+def test_baseten_chat_usage() -> None:
+    response_data = {
+        'model': 'zai-org/GLM-5.3-Flash',
+        'usage': {
+            'prompt_tokens': 100,
+            'prompt_tokens_details': {'cached_tokens': 30, 'audio_tokens': 5},
+            'completion_tokens': 40,
+            'completion_tokens_details': {'reasoning_tokens': 10, 'audio_tokens': 3},
+        },
+    }
+
+    extracted = extract_usage(response_data, provider_id='baseten', api_flavor='chat')
+
+    assert extracted.model is not None
+    assert extracted.model.id == 'zai-org/GLM-5.3-Flash'
+    assert extracted.usage == Usage(
+        input_tokens=100,
+        cache_read_tokens=30,
+        input_audio_tokens=5,
+        output_tokens=40,
+        output_audio_tokens=3,
+        output_reasoning_tokens=10,
+    )
+
+
+def test_baseten_messages_usage() -> None:
+    response_data = {
+        'model': 'zai-org/GLM-5.3-Flash',
+        'usage': {'input_tokens': 70, 'cache_read_input_tokens': 30, 'output_tokens': 40},
+    }
+
+    extracted = extract_usage(response_data, provider_id='baseten', api_flavor='anthropic')
+
+    assert extracted.usage == Usage(input_tokens=100, cache_read_tokens=30, output_tokens=40)
+    assert extracted.calc_price().total_price == Decimal('0.0000314')
+
+
+# The Databricks bodies follow the documented usage fields; no recorded response is public.
+# https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/api-reference#usage
+@pytest.mark.parametrize('api_flavor', ['default', 'chat'])
+def test_databricks_chat_usage(api_flavor: str) -> None:
+    response_data = {
+        'object': 'chat.completion',
+        'model': 'databricks-glm-5-3',
+        'usage': {
+            'prompt_tokens': 12_011,
+            'completion_tokens': 80,
+            'total_tokens': 12_091,
+            'reasoning_tokens': 30,
+            'cache_read_input_tokens': 12_002,
+        },
+    }
+
+    extracted = extract_usage(response_data, provider_id='databricks', api_flavor=api_flavor)
+
+    assert extracted.model is not None
+    assert extracted.model.id == 'databricks-glm-5-3'
+    assert extracted.usage == Usage(
+        input_tokens=12_011, cache_read_tokens=12_002, output_tokens=80, output_reasoning_tokens=30
+    )
+    assert extracted.calc_price(genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC)).total_price == Decimal(
+        '0.00348512'
+    )
+
+
+def test_databricks_chat_usage_without_cache_or_reasoning() -> None:
+    response_data = {
+        'object': 'chat.completion',
+        'model': 'databricks-gpt-oss-120b',
+        'usage': {'prompt_tokens': 7, 'completion_tokens': 74, 'total_tokens': 81},
+    }
+
+    extracted = extract_usage(response_data, provider_id='databricks', api_flavor='chat')
+
+    assert extracted.usage == Usage(input_tokens=7, output_tokens=74)
+    assert extracted.calc_price(genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC)).total_price == Decimal(
+        '0.00004545'
+    )
+
+
+def test_databricks_open_responses_usage() -> None:
+    response_data = {
+        'object': 'response',
+        'model': 'databricks-kimi-k3',
+        'usage': {
+            'input_tokens': 100,
+            'input_tokens_details': {'cached_tokens': 40},
+            'output_tokens': 50,
+            'output_tokens_details': {'reasoning_tokens': 20},
+            'total_tokens': 150,
+        },
+    }
+
+    extracted = extract_usage(
+        response_data,
+        provider_api_url='https://adb-1234567890123456.7.azuredatabricks.net/serving-endpoints/open-responses',
+        api_flavor='responses',
+    )
+
+    assert extracted.provider.id == 'databricks'
+    assert extracted.usage == Usage(
+        input_tokens=100, cache_read_tokens=40, output_tokens=50, output_reasoning_tokens=20
+    )
+    assert extracted.calc_price(genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC)).total_price == Decimal(
+        '0.000942'
+    )
+
+
+def test_databricks_embeddings_usage() -> None:
+    response_data = {
+        'object': 'list',
+        'model': 'databricks-gte-large-en',
+        'data': [{'object': 'embedding', 'index': 0, 'embedding': [0.1, 0.2]}],
+        'usage': {'prompt_tokens': 1_000_000, 'total_tokens': 1_000_000},
+    }
+
+    extracted = extract_usage(response_data, provider_id='databricks', api_flavor='embeddings')
+
+    assert extracted.usage == Usage(input_tokens=1_000_000)
+    assert extracted.calc_price(genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC)).total_price == Decimal(
+        '0.13'
+    )
+
+
+@pytest.mark.parametrize(
+    'model,expected_price',
+    [
+        # 0.75M five-minute writes at $3.75/MTok plus 0.25M one-hour writes at $6/MTok.
+        pytest.param('global.anthropic.claude-sonnet-4-6', Decimal('4.3125'), id='global'),
+        # The regional endpoint carries a 10% premium: $4.125 and $6.60/MTok.
+        pytest.param('us.anthropic.claude-sonnet-4-6', Decimal('4.74375'), id='regional'),
+    ],
+)
+def test_bedrock_converse_cache_write_ttl(model: str, expected_price: Decimal) -> None:
+    """Bedrock Converse reports the cache write TTL split in `usage.cacheDetails`."""
+    response_data = {
+        'model': model,
+        'usage': {
+            'inputTokens': 0,
+            'cacheReadInputTokens': 0,
+            'cacheWriteInputTokens': 1_000_000,
+            'cacheDetails': [{'ttl': '1h', 'inputTokens': 250_000}, {'ttl': '5m', 'inputTokens': 750_000}],
+            'outputTokens': 0,
+            'totalTokens': 1_000_000,
+        },
+    }
+
+    extracted = extract_usage(response_data, provider_id='aws')
+
+    assert extracted.usage == Usage(
+        input_tokens=1_000_000,
+        cache_write_tokens=1_000_000,
+        cache_write_5m_tokens=750_000,
+        cache_write_1h_tokens=250_000,
+        cache_read_tokens=0,
+        output_tokens=0,
+    )
+    assert (
+        extracted.calc_price(genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC)).total_price == expected_price
+    )
+
+
+@pytest.mark.parametrize(
+    'provider_id,model,expected_price',
+    [
+        # 0.5M five-minute writes at $3.75/MTok plus 0.5M one-hour writes at $6/MTok.
+        pytest.param('aws', 'global.anthropic.claude-sonnet-4-6', Decimal('4.875'), id='aws-global'),
+        # The regional endpoint carries a 10% premium: $4.125 and $6.60/MTok.
+        pytest.param('aws', 'us.anthropic.claude-sonnet-4-6', Decimal('5.3625'), id='aws-regional'),
+        pytest.param('google', 'claude-sonnet-4-6', Decimal('4.875'), id='google'),
+        pytest.param('azure', 'claude-sonnet-4-6', Decimal('4.875'), id='azure'),
+    ],
+)
+def test_anthropic_platform_cache_write_ttl(provider_id: str, model: str, expected_price: Decimal) -> None:
+    """Claude on Bedrock, Vertex AI and Azure AI Foundry reports the cache write TTL split like Anthropic's API."""
+    response_data = {
+        'model': model,
+        'usage': {
+            'input_tokens': 0,
+            'cache_creation': {'ephemeral_5m_input_tokens': 500_000, 'ephemeral_1h_input_tokens': 500_000},
+            'cache_creation_input_tokens': 1_000_000,
+            'cache_read_input_tokens': 0,
+            'output_tokens': 0,
+        },
+    }
+
+    extracted = extract_usage(response_data, provider_id=provider_id, api_flavor='anthropic')
+
+    assert extracted.usage == Usage(
+        input_tokens=1_000_000,
+        cache_write_tokens=1_000_000,
+        cache_write_5m_tokens=500_000,
+        cache_write_1h_tokens=500_000,
+        cache_read_tokens=0,
+        output_tokens=0,
+    )
+    assert (
+        extracted.calc_price(genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC)).total_price == expected_price
+    )
 
 
 @pytest.mark.parametrize(
@@ -91,7 +392,10 @@ def test_extract_usage_ok(response_data: Any, expected_model: str, expected_usag
     assert extracted_usage.usage == expected_usage
     assert extracted_usage.provider.name == 'Anthropic'
 
-    assert extracted_usage.calc_price().total_price == expected_price
+    assert (
+        extracted_usage.calc_price(genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC)).total_price
+        == expected_price
+    )
 
 
 def test_anthropic_native_thinking_tokens():
@@ -155,6 +459,307 @@ def test_openai():
 
 
 @pytest.mark.parametrize(
+    ('model_id', 'expected_price'),
+    [
+        ('moonshotai/Kimi-K3', Decimal('21.3')),
+        ('thinkingmachines/Inkling-NVFP4', Decimal('7.67')),
+    ],
+)
+def test_modal_chat_usage(model_id: str, expected_price: Decimal) -> None:
+    response_data = {
+        'model': model_id,
+        'usage': {
+            'prompt_tokens': 3_000_000,
+            'prompt_tokens_details': {'cached_tokens': 1_000_000, 'cache_write_tokens': 1_000_000},
+            'completion_tokens': 1_000_000,
+            'reasoning_tokens': 500_000,
+        },
+    }
+
+    extracted_usage = extract_usage(
+        response_data,
+        provider_api_url='https://example--kimi-k3.modal.run/v1',
+        api_flavor='chat',
+    )
+
+    assert extracted_usage.provider.id == 'modal'
+    assert extracted_usage.model is not None
+    assert extracted_usage.model.id == model_id
+    assert extracted_usage.usage == Usage(
+        input_tokens=3_000_000,
+        cache_read_tokens=1_000_000,
+        cache_write_tokens=1_000_000,
+        output_tokens=1_000_000,
+        output_reasoning_tokens=500_000,
+    )
+    assert (
+        extracted_usage.calc_price(genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC)).total_price
+        == expected_price
+    )
+
+
+def test_cloudflare_chat_usage() -> None:
+    response_data = {
+        'model': '@cf/deepseek-ai/deepseek-v4-flash-0731',
+        'usage': {
+            'prompt_tokens': 2_000_000,
+            'prompt_tokens_details': {'cached_tokens': 1_000_000},
+            'completion_tokens': 1_000_000,
+            'completion_tokens_details': {'reasoning_tokens': 500_000},
+        },
+    }
+
+    extracted_usage = extract_usage(response_data, provider_id='cloudflare-workers-ai', api_flavor='chat')
+
+    assert extracted_usage.provider.id == 'cloudflare'
+    assert extracted_usage.model is not None
+    assert extracted_usage.model.id == '@cf/deepseek-ai/deepseek-v4-flash-0731'
+    assert extracted_usage.usage == Usage(
+        input_tokens=2_000_000,
+        cache_read_tokens=1_000_000,
+        output_tokens=1_000_000,
+        output_reasoning_tokens=500_000,
+    )
+    assert extracted_usage.calc_price().total_price == Decimal('1.774')
+
+
+def test_cloudflare_native_rest_usage() -> None:
+    response_data: dict[str, object] = {
+        'result': {
+            'response': 'Hello',
+            'usage': {'prompt_tokens': 2_000_000, 'completion_tokens': 1_000_000, 'total_tokens': 3_000_000},
+        },
+        'success': True,
+        'errors': [],
+        'messages': [],
+    }
+
+    extracted_usage = extract_usage(
+        response_data,
+        provider_api_url='https://api.cloudflare.com/client/v4/accounts/test-account/ai/run/@cf/meta/llama-3.2-1b-instruct',
+    )
+
+    assert extracted_usage.provider.id == 'cloudflare'
+    assert extracted_usage.model is not None
+    assert extracted_usage.model.id == '@cf/meta/llama-3.2-1b-instruct'
+    assert extracted_usage.usage == Usage(input_tokens=2_000_000, output_tokens=1_000_000)
+    assert extracted_usage.calc_price().total_price == Decimal('0.255')
+
+
+@pytest.mark.parametrize(
+    'provider_api_url',
+    [
+        'https://api.cloudflare.com/client/v4/accounts/test-account/ai/run/@cf/example/unknown-model',
+        'https://api.cloudflare.com/client/v4/accounts/test-account/ai/v1',
+    ],
+)
+def test_cloudflare_native_rest_usage_without_known_url_model(provider_api_url: str) -> None:
+    response_data = {'result': {'usage': {'prompt_tokens': 2, 'completion_tokens': 1}}}
+
+    extracted_usage = extract_usage(response_data, provider_api_url=provider_api_url)
+
+    assert extracted_usage.model is None
+    assert extracted_usage.usage == Usage(input_tokens=2, output_tokens=1)
+
+
+def test_cloudflare_embeddings_usage() -> None:
+    response_data = {
+        'model': '@cf/baai/bge-m3',
+        'usage': {'prompt_tokens': 1_000_000, 'total_tokens': 1_000_000},
+    }
+
+    extracted_usage = extract_usage(response_data, provider_id='cloudflare', api_flavor='embeddings')
+
+    assert extracted_usage.usage == Usage(input_tokens=1_000_000)
+    assert extracted_usage.calc_price().total_price == Decimal('0.012')
+
+
+def test_cloudflare_decisions_usage() -> None:
+    response_data = {
+        'result': {
+            'model': 'clef',
+            'answers': {'urgent': {'type': 'noul', 'noul': 0.9}},
+            'usage': {'input_tokens': 1_000_000, 'output_tokens': 12},
+        },
+        'success': True,
+    }
+
+    extracted_usage = extract_usage(response_data, provider_id='cloudflare', api_flavor='decisions')
+
+    assert extracted_usage.provider.id == 'cloudflare'
+    assert extracted_usage.model is not None
+    assert extracted_usage.model.id == '@cf/cloudflare/clef'
+    assert extracted_usage.usage == Usage(input_tokens=1_000_000, output_tokens=12)
+    assert extracted_usage.calc_price().output_price == 0
+    assert extracted_usage.calc_price().total_price == Decimal('0.24')
+
+
+@pytest.mark.parametrize('with_details', [True, False])
+def test_perplexity_responses_usage_and_price(with_details: bool) -> None:
+    # Constructed from the Agent model/schema and Perplexity's own synthetic usage test, not a recording:
+    # https://docs.perplexity.ai/docs/agent-api/models
+    # https://github.com/perplexityai/wandr/blob/9ea23c7f24d0aaabc2c87b26815a513001b2e7ce/agents/relay/tests/test_perplexity_usage.py
+    # Web search uses tool_calls_details.search_web.invocation, not Sonar's num_search_queries:
+    # https://docs.perplexity.ai/docs/agent-api/tools/web-search
+    response_data: dict[str, Any] = {
+        'object': 'response',
+        'model': 'perplexity/sonar',
+        'usage': {
+            'input_tokens': 1_000,
+            'input_tokens_details': {'cache_read_input_tokens': 800, 'cached_tokens': 300},
+            'output_tokens': 100,
+            'output_tokens_details': {'reasoning_tokens': 50},
+            'tool_calls_details': {'search_web': {'invocation': 2}},
+            'total_tokens': 1_100,
+        },
+    }
+    if not with_details:
+        del response_data['usage']['input_tokens_details']
+        del response_data['usage']['output_tokens_details']
+        del response_data['usage']['tool_calls_details']
+
+    extracted = extract_usage(response_data, provider_id='perplexity', api_flavor='responses')
+
+    assert extracted.model is not None
+    assert extracted.model.id == 'perplexity/sonar'
+    if with_details:
+        assert extracted.usage == Usage(
+            input_tokens=1_000, cache_read_tokens=800, output_tokens=100, output_reasoning_tokens=50, web_searches=2
+        )
+    else:
+        assert extracted.usage == Usage(input_tokens=1_000, output_tokens=100)
+    for month, day, context, expected_total in [
+        (10, 15, None, '0.00535'),
+        (10, 15, {'search_type': 'web'}, '0.00535'),
+        (9, 23, {'search_type': 'fast'}, '0.00235'),
+        (9, 24, {'search_type': 'fast'}, '0.00235'),
+        (10, 14, {'search_type': 'fast'}, '0.00235'),
+        (10, 15, {'search_type': 'fast'}, '0.00235'),
+    ]:
+        price = extracted.calc_price(
+            genai_request_timestamp=datetime(2026, month, day, tzinfo=UTC), price_context=context
+        )
+        assert price.input_price == (Decimal('0.0001') if with_details else Decimal('0.00025'))
+        assert price.output_price == Decimal('0.00025')
+        assert price.total_price == (Decimal(expected_total) if with_details else Decimal('0.0005'))
+
+
+def test_perplexity_decisions_usage() -> None:
+    response_data = {
+        'model': 'pplx-decider-v1.1-27b',
+        'answers': {'defect': {'type': 'noul', 'noul': 0.94}},
+        'usage': {'input_tokens': 367, 'output_tokens': 3},
+    }
+
+    extracted_usage = extract_usage(response_data, provider_id='perplexity', api_flavor='decisions')
+
+    assert extracted_usage.model is not None
+    assert extracted_usage.model.id == 'pplx-decider-v1.1-27b'
+    assert extracted_usage.usage == Usage(input_tokens=367, output_tokens=3)
+    assert extracted_usage.calc_price().total_price == Decimal('0.00000734')
+
+
+def test_perplexity_agent_api_usage() -> None:
+    response_data = {
+        'model': 'perplexity/sonar',
+        'object': 'response',
+        'usage': {
+            'input_tokens': 1_000_000,
+            'input_tokens_details': {'cache_creation_input_tokens': 0, 'cache_read_input_tokens': 200_000},
+            'output_tokens': 100_000,
+            'total_tokens': 1_100_000,
+        },
+    }
+
+    extracted_usage = extract_usage(response_data, provider_id='perplexity', api_flavor='responses')
+
+    assert extracted_usage.model is not None
+    assert extracted_usage.model.id == 'perplexity/sonar'
+    assert extracted_usage.usage == Usage(input_tokens=1_000_000, cache_read_tokens=200_000, output_tokens=100_000)
+    assert extracted_usage.calc_price().total_price == Decimal('0.4625')
+
+
+def test_openrouter_decisions_usage() -> None:
+    response_data = {
+        'model': 'typesafe/jev-1.13-20260917',
+        'provider': 'TypeSafe',
+        'answers': {'is_bug': {'type': 'noul', 'noul': 0.96}},
+        'usage': {'cost': 0.000019992, 'input_tokens': 476, 'output_tokens': 70},
+    }
+
+    extracted_usage = extract_usage(
+        response_data,
+        provider_api_url='https://openrouter.ai/api/alpha/decisions',
+        api_flavor='decisions',
+    )
+
+    assert extracted_usage.provider.id == 'openrouter'
+    assert extracted_usage.model is not None
+    assert extracted_usage.model.id == 'typesafe/jev-1.13'
+    assert extracted_usage.usage == Usage(input_tokens=476, output_tokens=70)
+    assert extracted_usage.calc_price().total_price == Decimal('0.000019992')
+
+
+def test_moonshot_chat_usage_bills_cache_writes() -> None:
+    response_data = {
+        'model': 'kimi-k3',
+        'usage': {
+            'prompt_tokens': 373,
+            'completion_tokens': 112,
+            'total_tokens': 485,
+            'completion_tokens_details': {'reasoning_tokens': 71},
+            'prompt_tokens_details': {'cache_write_tokens': 256},
+        },
+    }
+
+    extracted_usage = extract_usage(response_data, provider_id='moonshotai', api_flavor='chat')
+
+    assert extracted_usage.usage == Usage(
+        input_tokens=373,
+        cache_write_tokens=256,
+        output_tokens=112,
+        output_reasoning_tokens=71,
+    )
+    price = extracted_usage.calc_price()
+    assert price.model_price.cache_write_mtok == Decimal('3')
+    assert price.input_price == Decimal('0.001119')
+    assert price.output_price == Decimal('0.00168')
+
+
+def test_modal_responses_usage() -> None:
+    response_data = {
+        'model': 'moonshotai/Kimi-K3',
+        'usage': {
+            'input_tokens': 90,
+            'input_tokens_details': {'cached_tokens': 64, 'cache_write_tokens': 0},
+            'output_tokens': 188,
+            'output_tokens_details': {'reasoning_tokens': 169},
+            'total_tokens': 278,
+        },
+    }
+
+    extracted_usage = extract_usage(
+        response_data,
+        provider_api_url='https://example--kimi-k3.modal.run/v1',
+        api_flavor='responses',
+    )
+
+    assert extracted_usage.provider.id == 'modal'
+    assert extracted_usage.model is not None
+    assert extracted_usage.model.id == 'moonshotai/Kimi-K3'
+    assert extracted_usage.usage == Usage(
+        input_tokens=90,
+        cache_read_tokens=64,
+        cache_write_tokens=0,
+        output_tokens=188,
+        output_reasoning_tokens=169,
+    )
+    assert extracted_usage.calc_price().input_price == Decimal('0.0000972')
+    assert extracted_usage.calc_price().output_price == Decimal('0.00282')
+    assert extracted_usage.calc_price().total_price == Decimal('0.0029172')
+
+
+@pytest.mark.parametrize(
     ('api_flavor', 'usage_data'),
     [
         (
@@ -185,11 +790,52 @@ def test_openai_cache_write_tokens(api_flavor: str, usage_data: dict[str, Any]):
         cache_read_tokens=0,
         output_tokens=300,
     )
-    assert extracted_usage.calc_price().total_price == Decimal('0.02143')
+    assert extracted_usage.calc_price().total_price == Decimal('0.015944')
 
 
-def test_openai_realtime_usage_modalities():
-    provider = next(provider for provider in providers if provider.id == 'openai')
+@pytest.mark.parametrize(
+    ('api_flavor', 'usage_data'),
+    [
+        (
+            'chat',
+            {
+                'prompt_tokens': 2_006,
+                'prompt_tokens_details': {'cached_tokens': 0, 'cache_write_tokens': 1_920},
+                'completion_tokens': 300,
+            },
+        ),
+        (
+            'responses',
+            {
+                'input_tokens': 2_006,
+                'input_tokens_details': {'cached_tokens': 0, 'cache_write_tokens': 1_920},
+                'output_tokens': 300,
+            },
+        ),
+    ],
+)
+def test_azure_cache_write_tokens(api_flavor: str, usage_data: dict[str, Any]):
+    """Azure's OpenAI-compatible v1 API returns the same usage shape as direct OpenAI
+    (see test_openai_cache_write_tokens); this mirrors it for the `azure` provider,
+    whose extractors were missing the `cache_write_tokens` mapping.
+
+    `gpt-5.6-sol` resolves through Azure's `fallback_model_providers: [openai]`, so the price
+    asserts the cache-write premium is actually applied, not just that the tokens were extracted.
+    """
+    response_data = {'model': 'gpt-5.6-sol', 'usage': usage_data}
+    extracted_usage = extract_usage(response_data, provider_id='azure', api_flavor=api_flavor)
+
+    assert extracted_usage.usage == Usage(
+        input_tokens=2_006,
+        cache_write_tokens=1_920,
+        cache_read_tokens=0,
+        output_tokens=300,
+    )
+    assert extracted_usage.calc_price().total_price == Decimal('0.015944')
+
+
+@pytest.mark.parametrize('provider_id', ['openai', 'azure'])
+def test_openai_realtime_usage_modalities(provider_id: str):
     response_data = {
         'type': 'response.done',
         'response': {
@@ -212,21 +858,21 @@ def test_openai_realtime_usage_modalities():
         },
     }
 
-    assert provider.extract_usage(response_data, api_flavor='realtime') == (
-        None,
-        Usage(
-            input_tokens=1_000,
-            output_tokens=500,
-            cache_read_tokens=400,
-            input_text_tokens=600,
-            output_text_tokens=200,
-            input_audio_tokens=250,
-            output_audio_tokens=300,
-            input_image_tokens=150,
-            cache_text_read_tokens=250,
-            cache_audio_read_tokens=100,
-            cache_image_read_tokens=50,
-        ),
+    extracted_usage = extract_usage(response_data, provider_id=provider_id, api_flavor='realtime')
+
+    assert extracted_usage.provider.id == provider_id
+    assert extracted_usage.usage == Usage(
+        input_tokens=1_000,
+        output_tokens=500,
+        cache_read_tokens=400,
+        input_text_tokens=600,
+        output_text_tokens=200,
+        input_audio_tokens=250,
+        output_audio_tokens=300,
+        input_image_tokens=150,
+        cache_text_read_tokens=250,
+        cache_audio_read_tokens=100,
+        cache_image_read_tokens=50,
     )
 
 
@@ -289,6 +935,50 @@ def test_mistral():
     assert provider.extract_usage(response_data_no_cache) == snapshot(
         ('mistral-large-2512', Usage(input_tokens=10, output_tokens=5))
     )
+
+
+def test_meta_muse_wonder_chat_and_responses_usage():
+    provider = next(provider for provider in providers if provider.id == 'meta')
+    chat = {
+        'model': 'muse-wonder-1.0',
+        'usage': {
+            'prompt_tokens': 100,
+            'prompt_tokens_details': {'cached_tokens': 20},
+            'completion_tokens': 40,
+            'completion_tokens_details': {'reasoning_tokens': 10},
+        },
+    }
+    response = {
+        'model': 'muse-wonder-1.0',
+        'usage': {
+            'input_tokens': 100,
+            'input_tokens_details': {'cached_tokens': 20},
+            'output_tokens': 40,
+            'output_tokens_details': {'reasoning_tokens': 10},
+        },
+    }
+    expected = Usage(input_tokens=100, cache_read_tokens=20, output_tokens=40, output_reasoning_tokens=10)
+    assert provider.extract_usage(chat, api_flavor='chat') == ('muse-wonder-1.0', expected)
+    assert provider.extract_usage(response, api_flavor='responses') == ('muse-wonder-1.0', expected)
+    assert extract_usage(chat, provider_id='meta', api_flavor='chat').usage == expected
+    assert extract_usage(response, provider_id='meta', api_flavor='responses').usage == expected
+
+
+def test_mistral_ocr():
+    response_data = {
+        'model': 'mistral-ocr-4-1-completion',
+        'usage_info': {'pages_processed': 29, 'doc_size_bytes': 108_451_500},
+    }
+
+    extracted_usage = extract_usage(response_data, provider_id='mistral', api_flavor='ocr')
+    assert extracted_usage.usage == Usage(input_document_pages=29)
+    assert extracted_usage.model is not None
+    assert extracted_usage.model.id == 'mistral-ocr-4-1'
+    assert extracted_usage.calc_price().total_price == Decimal('0.116')
+
+    annotated_usage = extract_usage(response_data, provider_id='mistral', api_flavor='ocr_annotated')
+    assert annotated_usage.usage == Usage(input_document_pages=29, input_annotated_document_pages=29)
+    assert annotated_usage.calc_price().total_price == Decimal('0.145')
 
 
 def test_groq_cached_tokens():
@@ -479,12 +1169,8 @@ def test_extracted_usage_calc_price_requires_model():
         ({'model': 'x', 'usage': {}}, snapshot('Missing value at `usage.input_tokens`')),
         ({'model': 'x', 'usage': 123}, snapshot('Expected `usage` value to be a Mapping, got int')),
         (
-            {'model': 'x', 'usage': {'input_tokens': 123.0}},
-            snapshot('Expected `usage.input_tokens` value to be a int, got float'),
-        ),
-        (
             {'model': 'x', 'usage': {'input_tokens': []}},
-            snapshot('Expected `usage.input_tokens` value to be a int, got list'),
+            snapshot('Expected `usage.input_tokens` value to be a int or float or Decimal, got list'),
         ),
     ],
 )
@@ -600,7 +1286,7 @@ def test_usage_extractor_skips_optional_nested_path_with_null_parent():
     )
 
 
-def test_usage_extractor_skips_optional_float_value():
+def test_usage_extractor_accepts_optional_integral_float_value():
     extractor = UsageExtractor(
         root='usage',
         mappings=[
@@ -609,10 +1295,114 @@ def test_usage_extractor_skips_optional_float_value():
         ],
     )
 
-    assert extractor.extract({'model': 'test-model', 'usage': {'prompt_tokens': 13.0, 'output_tokens': 2}}) == (
+    model, usage = extractor.extract({'model': 'test-model', 'usage': {'prompt_tokens': 3.0, 'output_tokens': 2}})
+
+    assert (model, usage) == (
         'test-model',
-        Usage(output_tokens=2),
+        Usage(input_tokens=3.0, output_tokens=2),
     )
+    assert type(usage.input_tokens) is float
+
+
+def test_usage_extractor_preserves_decimal_value() -> None:
+    extractor = UsageExtractor(
+        root='usage',
+        mappings=[UsageExtractorMapping(path='duration', dest='audio_seconds')],
+    )
+    value = Decimal('3.00')
+
+    model, usage = extractor.extract({'model': 'test-model', 'usage': {'duration': value}})
+
+    assert model == 'test-model'
+    assert usage.audio_seconds is value
+
+
+def test_usage_extractor_accumulates_fractional_values_by_destination() -> None:
+    extractor = UsageExtractor(
+        root='usage',
+        mappings=[
+            UsageExtractorMapping(path='first_seconds', dest='audio_seconds'),
+            UsageExtractorMapping(path='second_seconds', dest='audio_seconds'),
+        ],
+    )
+
+    model, usage = extractor.extract({'model': 'test-model', 'usage': {'first_seconds': 0.1, 'second_seconds': 0.2}})
+
+    assert model == 'test-model'
+    assert usage.audio_seconds == 0.3
+    assert type(usage.audio_seconds) is float
+
+
+def test_usage_extractor_accumulates_mixed_values_as_decimal() -> None:
+    extractor = UsageExtractor(
+        root='usage',
+        mappings=[
+            UsageExtractorMapping(path='first_seconds', dest='audio_seconds'),
+            UsageExtractorMapping(path='second_seconds', dest='audio_seconds'),
+            UsageExtractorMapping(path='whole_seconds', dest='audio_seconds'),
+        ],
+    )
+
+    model, usage = extractor.extract(
+        {
+            'model': 'test-model',
+            'usage': {
+                'first_seconds': Decimal('0.1'),
+                'second_seconds': 0.2,
+                'whole_seconds': 1,
+            },
+        }
+    )
+
+    assert model == 'test-model'
+    assert usage.audio_seconds == Decimal('1.3')
+    assert isinstance(usage.audio_seconds, Decimal)
+
+
+@pytest.mark.parametrize(
+    'invalid_value',
+    [
+        -1,
+        -0.1,
+        float('nan'),
+        float('inf'),
+        Decimal('-0.1'),
+        Decimal('NaN'),
+        Decimal('Infinity'),
+        True,
+    ],
+)
+def test_usage_extractor_rejects_invalid_component_before_accumulation(invalid_value: Any) -> None:
+    extractor = UsageExtractor(
+        root='usage',
+        mappings=[
+            UsageExtractorMapping(path='invalid', dest='audio_seconds', required=False),
+            UsageExtractorMapping(path='offset', dest='audio_seconds'),
+        ],
+    )
+
+    with pytest.raises(
+        ValueError, match='Invalid usage value for audio_seconds: expected a finite non-negative int, float, or Decimal'
+    ):
+        extractor.extract({'model': 'test-model', 'usage': {'invalid': invalid_value, 'offset': 2}})
+
+
+def test_public_extract_usage_preserves_fractional_values() -> None:
+    response_data = {
+        'model': 'gpt-4.1',
+        'usage': {
+            'prompt_tokens': 13.0,
+            'completion_tokens': 0.25,
+            'prompt_tokens_details': {'cached_tokens': None},
+            'completion_tokens_details': {'reasoning_tokens': None},
+        },
+    }
+
+    extracted = extract_usage(response_data, provider_id='openai', api_flavor='chat')
+
+    assert extracted.usage == Usage(input_tokens=13.0, output_tokens=0.25)
+    assert type(extracted.usage.input_tokens) is float
+    assert type(extracted.usage.output_tokens) is float
 
 
 def test_usage_extractor_skips_optional_nested_path_after_wrong_type_parent():
@@ -922,7 +1712,9 @@ def test_bedrock():
     assert extracted_usage.provider.name == snapshot('AWS Bedrock')
     assert extracted_usage.model is not None
     assert extracted_usage.model.id == snapshot('amazon.nova-lite-v1:0')
-    assert extracted_usage.calc_price().total_price == snapshot(Decimal('0.00002454'))
+    assert extracted_usage.calc_price(
+        genai_request_timestamp=datetime(2026, 10, 17, tzinfo=UTC)
+    ).total_price == snapshot(Decimal('0.00002454'))
 
 
 anthropic_response_data = {
@@ -1101,7 +1893,7 @@ def test_accumulate_extracted_usage():
         "ExtractedUsage(usage=Usage(input_tokens=200, output_tokens=324, input_text_tokens=150, output_text_tokens=36, input_tool_tokens=50, output_reasoning_tokens=288), model=Model(id='gemini-2.5-flash', name='Gemini 2.5 Flash', ...), provider=Provider(id='google', name='Google', ...), auto_update_timestamp=None)"
     )
     assert repr(double_extracted.calc_price()) == snapshot(
-        "PriceCalculation(input_price=Decimal('0.00006'), output_price=Decimal('0.00081'), total_price=Decimal('0.00087'), model=Model(id='gemini-2.5-flash', name='Gemini 2.5 Flash', ...), provider=Provider(id='google', name='Google', ...), model_price=ModelPrice($0.3/input MTok, $2.5/output MTok, $0.03/input cache read MTok, $1/input audio MTok, $0.1/input audio cache read MTok), auto_update_timestamp=None)"
+        "PriceCalculation(input_price=Decimal('0.00006'), output_price=Decimal('0.00081'), total_price=Decimal('0.00087'), model=Model(id='gemini-2.5-flash', name='Gemini 2.5 Flash', ...), provider=Provider(id='google', name='Google', ...), model_price=ModelPrice($0.3/input MTok, $2.5/output MTok, $0.03/input cache read MTok, $1/input audio MTok, $0.1/input audio cache read MTok, $35/web searches K), auto_update_timestamp=None)"
     )
     assert Usage(input_tokens=10, output_tokens=10) + Usage(output_tokens=10) == Usage(
         input_tokens=10, output_tokens=20
@@ -1110,6 +1902,43 @@ def test_accumulate_extracted_usage():
     assert Usage(input_tokens=1).__radd__(Usage(output_tokens=2)) == Usage(input_tokens=1, output_tokens=2)
     with pytest.raises(TypeError):
         _ = Usage() + 1
+
+
+@pytest.mark.parametrize('with_details', [True, False])
+def test_xai_responses_usage_and_price(with_details: bool) -> None:
+    # Model and usage excerpt from the public POST /v1/responses example:
+    # https://docs.x.ai/developers/rest-api-reference/inference/responses
+    # output_tokens includes reasoning, unlike xAI's native and chat completion counts:
+    # https://docs.x.ai/cookbook/examples/prompt-caching
+    response_data: dict[str, Any] = {
+        'model': 'grok-4.20-0309-reasoning',
+        'usage': {
+            'input_tokens': 131,
+            'input_tokens_details': {'cached_tokens': 128},
+            'output_tokens': 624,
+            'output_tokens_details': {'reasoning_tokens': 246},
+            'total_tokens': 755,
+        },
+    }
+    if not with_details:
+        del response_data['usage']['input_tokens_details']
+        del response_data['usage']['output_tokens_details']
+
+    extracted = extract_usage(response_data, provider_id='x-ai', api_flavor='responses')
+
+    assert extracted.provider.extract_usage(response_data, api_flavor='responses')[0] == 'grok-4.20-0309-reasoning'
+    assert extracted.model is not None
+    assert extracted.model.id == 'grok-4.20'
+    if with_details:
+        assert extracted.usage == Usage(
+            input_tokens=131, cache_read_tokens=128, output_tokens=624, output_reasoning_tokens=246
+        )
+    else:
+        assert extracted.usage == Usage(input_tokens=131, output_tokens=624)
+    price = extracted.calc_price()
+    assert price.input_price == (Decimal('0.00002935') if with_details else Decimal('0.00016375'))
+    assert price.output_price == Decimal('0.00156')
+    assert price.total_price == (Decimal('0.00158935') if with_details else Decimal('0.00172375'))
 
 
 def test_xai_native():
@@ -1132,6 +1961,50 @@ def test_xai_native():
     extracted_usage = extract_usage(response_data, provider_id='x-ai')
     assert extracted_usage.usage == usage
     assert extracted_usage.calc_price().total_price == Decimal('0.0000349')
+
+
+def test_xai_realtime_duration_and_message_usage_and_price() -> None:
+    provider = next(provider for provider in providers if provider.id == 'x-ai')
+    response_data: dict[str, Any] = {
+        'type': 'response.done',
+        'response': {'usage': {}},
+        'usage': {
+            'input_tokens': 5,
+            'input_token_details': {'text_tokens': 5, 'audio_tokens': 0},
+            'output_tokens': 42,
+            'output_token_details': {'text_tokens': 3, 'audio_tokens': 39},
+            'billable_audio_seconds': 60,
+            'input_text_messages': 2,
+        },
+    }
+
+    model, usage = provider.extract_usage(response_data, api_flavor='realtime')
+    assert model is None
+    assert usage == Usage(
+        input_tokens=5,
+        output_tokens=42,
+        input_text_tokens=5,
+        output_text_tokens=3,
+        input_audio_tokens=0,
+        output_audio_tokens=39,
+        input_text_messages=2,
+        audio_seconds=60,
+    )
+    for model_ref, timestamp, expected_total in [
+        ('grok-voice-think-fast-1.0', None, Decimal('0.058')),
+        ('grok-voice-think-fast-2.0', None, Decimal('0.088')),
+        ('grok-voice-latest', datetime(2026, 8, 4, tzinfo=UTC), Decimal('0.058')),
+        ('grok-voice-latest', datetime(2026, 8, 5, tzinfo=UTC), Decimal('0.088')),
+    ]:
+        price = calc_price(
+            usage,
+            model_ref=model_ref,
+            provider_id='x-ai',
+            genai_request_timestamp=timestamp,
+        )
+        assert price.input_price == Decimal('0.008')
+        assert price.output_price == 0
+        assert price.total_price == expected_total
 
 
 @pytest.mark.parametrize(
@@ -1196,3 +2069,27 @@ def test_perplexity_reasoning_pro_reports_reasoning_in_completion_tokens():
     extracted = extract_usage(response_data, provider_id='perplexity')
 
     assert extracted.usage == Usage(input_tokens=17, output_tokens=1_152)
+
+
+def test_cloudflare_clairic_native_decision_response() -> None:
+    # https://developers.cloudflare.com/workers-ai/models/clairic/
+    response: dict[str, object] = {
+        'result': {
+            'model': 'clairic',
+            'usage': {
+                'state_tokens': 61,
+                'image_tokens': 0,
+                'schema_tokens': 472,
+                'input_tokens': 655,
+                'output_tokens': 0,
+                'passes': 3,
+            },
+        },
+        'success': True,
+        'errors': [],
+        'messages': [],
+    }
+    result = extract_usage(response, provider_id='cloudflare', api_flavor='decisions')
+    assert result.model is not None and result.model.id == '@cf/cloudflare/clairic'
+    assert result.usage == Usage(input_tokens=655, output_tokens=0)
+    assert result.calc_price().total_price == Decimal('0.0000655')

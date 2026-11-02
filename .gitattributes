@@ -1,4 +1,4 @@
-.github/workflows/*.lock.yml linguist-generated=true merge=ours
+.github/workflows/*.lock.yml linguist-generated=true
 
 # Frozen v1 compatibility snapshots. No build step writes these, so drift here is
 # invisible to the `build` hook; their contents are pinned by tests/test_frozen_v1_data.py.
@@ -18,3 +18,7 @@ packages/python/genai_prices/data.py linguist-generated=true
 packages/python/genai_prices/data_units.py linguist-generated=true
 packages/js/src/data.ts linguist-generated=true
 packages/js/src/dataUnits.ts linguist-generated=true
+packages/go/data_units.go linguist-generated=true
+packages/go/internal/data/prices.json linguist-generated=true
+packages/rust/data/prices.json linguist-generated=true
+packages/rust/src/data_units.rs linguist-generated=true

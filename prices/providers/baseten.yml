@@ -1,0 +1,328 @@
+# yaml-language-server: $schema=.schema.json
+id: baseten
+name: Baseten
+description: OpenAI- and Anthropic-compatible hosted inference through Baseten Model APIs.
+pricing_urls:
+  - https://www.baseten.co/pricing/
+  - https://docs.baseten.co/inference/model-apis/overview
+api_pattern: 'https://inference\.baseten\.co(?:/|$)'
+provider_match:
+  contains: baseten
+price_comments: >-
+  Covers the complete public Model APIs pricing table. Baseten automatically caches prompt prefixes and bills cached input
+  at
+  the published cache-input rate. Context windows use the catalog's displayed values in thousands of tokens. Model IDs use
+  third-party namespaces, so they do not infer the Baseten provider without a Baseten provider ID or API URL.
+extractors:
+  - api_flavor: chat
+    root: usage
+    mappings:
+      - path: prompt_tokens
+        dest: input_tokens
+      - path: [prompt_tokens_details, cached_tokens]
+        dest: cache_read_tokens
+        required: false
+      - path: [prompt_tokens_details, audio_tokens]
+        dest: input_audio_tokens
+        required: false
+      - path: [completion_tokens_details, audio_tokens]
+        dest: output_audio_tokens
+        required: false
+      - path: [completion_tokens_details, reasoning_tokens]
+        dest: output_reasoning_tokens
+        required: false
+      - path: completion_tokens
+        dest: output_tokens
+
+  - api_flavor: anthropic
+    root: usage
+    mappings:
+      - path: input_tokens
+        dest: input_tokens
+      - path: cache_read_input_tokens
+        dest: input_tokens
+        required: false
+      - path: cache_read_input_tokens
+        dest: cache_read_tokens
+        required: false
+      - path: output_tokens
+        dest: output_tokens
+
+models:
+  - id: deepseek-ai/DeepSeek-V4-Flash-0731
+    name: DeepSeek V4 Flash 0731
+    match:
+      equals: deepseek-ai/DeepSeek-V4-Flash-0731
+    context_window: 1048000
+    prices_checked: 2026-11-02
+    prices:
+      input_mtok: 0.13
+      cache_read_mtok: 0.028
+      output_mtok: 0.26
+
+  - id: deepseek-ai/DeepSeek-V4-Pro
+    name: DeepSeek V4 Pro
+    match:
+      equals: deepseek-ai/DeepSeek-V4-Pro
+    context_window: 1048000
+    deprecated: true
+    prices_checked: 2026-10-09
+    # Replaced by V4 Pro 0813 in the Baseten Model APIs catalog; kept for historical usage.
+    price_comments: >-
+      No longer listed in the Baseten Model APIs catalog
+      (https://docs.baseten.co/inference/model-apis/overview, checked 2026-10-09); the
+      dated V4 Pro 0813 endpoint took its place.
+    prices:
+      input_mtok: 1.74
+      cache_read_mtok: 0.145
+      output_mtok: 3.48
+
+  - id: deepseek-ai/DeepSeek-V4-Pro-0813
+    name: DeepSeek V4 Pro 0813
+    match:
+      equals: deepseek-ai/DeepSeek-V4-Pro-0813
+    context_window: 1048000
+    prices_checked: 2026-11-02
+    prices:
+      input_mtok: 1.32
+      cache_read_mtok: 0.132
+      output_mtok: 3.96
+
+  - id: deepseek-ai/DeepSeek-V4.1-Flash
+    name: DeepSeek V4.1 Flash
+    match:
+      or:
+        - equals: deepseek-ai/DeepSeek-V4.1-Flash
+        - equals: deepseek-ai/DeepSeek-V4.1-Flash-1017
+    context_window: 1048000
+    prices:
+      input_mtok: 0.3
+      cache_read_mtok: 0.007
+      output_mtok: 1.2
+    prices_checked: 2026-11-02
+
+  - id: deepseek-ai/DeepSeek-V4.1-Flash-Fast
+    name: DeepSeek V4.1 Flash Fast
+    description: Faster speed tier of DeepSeek V4.1 Flash sharing its base model's weights.
+    match:
+      equals: deepseek-ai/DeepSeek-V4.1-Flash-Fast
+    context_window: 1048000
+    prices_checked: 2026-11-02
+    price_comments: >-
+      Rates and context window from https://www.baseten.co/pricing/ and
+      https://docs.baseten.co/inference/model-apis/overview.
+    prices:
+      input_mtok: 0.6
+      cache_read_mtok: 0.014
+      output_mtok: 2.4
+
+  - id: meta-models/muse-spark-open
+    name: Muse Spark Open
+    match:
+      equals: meta-models/muse-spark-open
+    context_window: 1048000
+    prices:
+      input_mtok: 1.25
+      cache_read_mtok: 0.15
+      output_mtok: 4.25
+    prices_checked: 2026-11-02
+
+  - id: moonshotai/Kimi-K2.6
+    name: Kimi K2.6
+    match:
+      equals: moonshotai/Kimi-K2.6
+    context_window: 262000
+    deprecated: true
+    prices_checked: 2026-10-09
+    price_comments: >-
+      No longer listed in the Baseten Model APIs catalog
+      (https://docs.baseten.co/inference/model-apis/overview, checked 2026-10-09).
+    prices:
+      input_mtok: 0.95
+      cache_read_mtok: 0.16
+      output_mtok: 4
+
+  - id: moonshotai/Kimi-K2.7-Code
+    name: Kimi K2.7 Code
+    match:
+      equals: moonshotai/Kimi-K2.7-Code
+    context_window: 262000
+    deprecated: true
+    prices_checked: 2026-10-09
+    # No longer in the Baseten docs catalog.
+    price_comments: >-
+      No longer listed in the Baseten Model APIs catalog
+      (https://docs.baseten.co/inference/model-apis/overview, checked 2026-10-09).
+    prices:
+      input_mtok: 0.95
+      cache_read_mtok: 0.16
+      output_mtok: 4
+
+  - id: moonshotai/Kimi-K3
+    name: Kimi K3
+    match:
+      equals: moonshotai/Kimi-K3
+    context_window: 1048000
+    prices_checked: 2026-11-02
+    prices:
+      input_mtok: 3
+      cache_read_mtok: 0.3
+      output_mtok: 15
+
+  - id: nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B
+    name: NVIDIA Nemotron 3 Ultra
+    match:
+      equals: nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B
+    context_window: 202000
+    prices_checked: 2026-11-02
+    prices:
+      input_mtok: 0.6
+      cache_read_mtok: 0.12
+      output_mtok: 2.4
+
+  - id: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B
+    name: Nemotron 3.5 Super VL
+    description: NVIDIA's multimodal Nemotron 3.5 Super model served through Baseten Model APIs.
+    match:
+      equals: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B
+    context_window: 1048000
+    prices_checked: 2026-11-02
+    price_comments: >-
+      Rates and context window from https://www.baseten.co/pricing/ and
+      https://docs.baseten.co/inference/model-apis/overview.
+    prices:
+      input_mtok: 0.2
+      cache_read_mtok: 0.04
+      output_mtok: 0.5
+
+  - id: openai/gpt-oss-120b
+    name: GPT OSS 120B
+    match:
+      equals: openai/gpt-oss-120b
+    context_window: 128000
+    prices_checked: 2026-11-02
+    price_comments: The pricing table does not publish a separate cached-input rate for this model.
+    prices:
+      input_mtok: 0.1
+      output_mtok: 0.5
+
+  - id: reflection/Beam-1.0
+    name: Beam
+    match:
+      equals: reflection/Beam-1.0
+    context_window: 1048000
+    prices:
+      - prices:
+          input_mtok: 1.3
+          cache_read_mtok: 0.13
+          output_mtok: 4.3
+      - constraint:
+          start_date: 2026-11-02
+        prices:
+          input_mtok: 0.4
+          cache_read_mtok: 0.04
+          output_mtok: 1.2
+    prices_checked: 2026-11-02
+
+  - id: thinkingmachines/inkling
+    name: Inkling
+    match:
+      equals: thinkingmachines/inkling
+    context_window: 1048000
+    deprecated: true
+    prices_checked: 2026-10-09
+    # No longer in the Baseten docs catalog.
+    price_comments: >-
+      No longer listed in the Baseten Model APIs catalog
+      (https://docs.baseten.co/inference/model-apis/overview, checked 2026-10-09).
+    prices:
+      input_mtok: 1
+      cache_read_mtok: 0.17
+      output_mtok: 4.05
+
+  - id: thinkingmachines/inkling-small
+    name: Inkling Small
+    match:
+      equals: thinkingmachines/inkling-small
+    context_window: 1048000
+    deprecated: true
+    prices_checked: 2026-10-09
+    # No longer in the Baseten docs catalog.
+    price_comments: >-
+      No longer listed in the Baseten Model APIs catalog
+      (https://docs.baseten.co/inference/model-apis/overview, checked 2026-10-09).
+    prices:
+      input_mtok: 0.5
+      cache_read_mtok: 0.1
+      output_mtok: 1.2
+
+  - id: zai-org/GLM-4.7
+    name: GLM 4.7
+    match:
+      equals: zai-org/GLM-4.7
+    context_window: 200000
+    deprecated: true
+    prices_checked: 2026-10-09
+    # No longer in the Baseten docs catalog.
+    price_comments: >-
+      No longer listed in the Baseten Model APIs catalog
+      (https://docs.baseten.co/inference/model-apis/overview, checked 2026-10-09).
+    prices:
+      input_mtok: 0.6
+      cache_read_mtok: 0.12
+      output_mtok: 2.2
+
+  - id: zai-org/GLM-5.2
+    name: GLM 5.2
+    match:
+      equals: zai-org/GLM-5.2
+    context_window: 1048000
+    prices_checked: 2026-11-02
+    prices:
+      input_mtok: 1.4
+      cache_read_mtok: 0.14
+      output_mtok: 4.4
+
+  - id: zai-org/GLM-5.2-Fast
+    name: GLM 5.2 Fast
+    match:
+      equals: zai-org/GLM-5.2-Fast
+    context_window: 1048000
+    prices_checked: 2026-11-02
+    prices:
+      input_mtok: 2.1
+      cache_read_mtok: 0.21
+      output_mtok: 6.6
+
+  - id: zai-org/GLM-5.3
+    name: GLM 5.3
+    match:
+      equals: zai-org/GLM-5.3
+    context_window: 1048000
+    prices_checked: 2026-11-02
+    prices:
+      input_mtok: 1.4
+      cache_read_mtok: 0.14
+      output_mtok: 4.4
+
+  - id: zai-org/GLM-5.3-Fast
+    name: GLM 5.3 Fast
+    match:
+      equals: zai-org/GLM-5.3-Fast
+    context_window: 1048000
+    prices:
+      input_mtok: 2.1
+      cache_read_mtok: 0.21
+      output_mtok: 6.6
+    prices_checked: 2026-11-02
+
+  - id: zai-org/GLM-5.3-Flash
+    name: GLM 5.3 Flash
+    match:
+      equals: zai-org/GLM-5.3-Flash
+    context_window: 1048000
+    prices_checked: 2026-11-02
+    prices:
+      input_mtok: 0.15
+      cache_read_mtok: 0.03
+      output_mtok: 0.5
